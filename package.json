@@ -1,0 +1,18 @@
+{
+  "name": "dsh-plugin-ambient-video",
+  "version": "1.0.0",
+  "description": "Ambient background video for DSH: Bilibili/YouTube/any-link fullscreen frosted-glass backdrop with sound-card state looping; commands /playurl /playstop /playsearch(CN) /playsearchw(global)",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "license": "MIT",
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  }
+}
