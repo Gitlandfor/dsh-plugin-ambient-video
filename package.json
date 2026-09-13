@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-ambient-video",
   "version": "1.0.0",
-  "description": "Ambient background video for DSH: Bilibili/YouTube/any-link fullscreen frosted-glass backdrop with sound-card state looping; commands /playurl /playstop /playsearch(CN) /playsearchw(global)",
+  "description": "氛围背景视频（DSH Ambient Background Video）：Bilibili/YouTube/任意链接全屏毛玻璃背景 + 声卡状态循环；命令 /playurl /playstop /playsearch(国内) /playsearchw(外网)",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -14,5 +14,18 @@
     "client": {
       "platform": "web"
     }
-  }
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "ambient",
+    "background",
+    "video",
+    "bilibili",
+    "youtube",
+    "frosted-glass",
+    "web"
+  ],
+  "homepage": "https://github.com/vilm/dsh-plugin-ambient-video"
 }
