@@ -9,7 +9,7 @@
 ## 演示
 
 - **v1.0.0 Release**：https://github.com/Gitlandfor/dsh-plugin-ambient-video/releases/tag/v1.0.0
-- **`demo-6-26s.mp4` —— 演示视频**（录屏裁切 6–26 秒片段，展示毛玻璃背景 + 播放/停止/搜索效果）：点上方 Release 链接 → Assets → `demo-6-26s.mp4` 预览/下载
+- **`demo.mp4` —— 演示视频**（效果展示）：点上方 Release 链接 → Assets → `demo.mp4` 预览/下载
 
 ## 功能
 
@@ -84,4 +84,4 @@
 |---|---|
 | 仓库 | https://github.com/Gitlandfor/dsh-plugin-ambient-video |
 | 版本 | v1.0.0（MIT） |
-| Release + 演示视频资产 | https://github.com/Gitlandfor/dsh-plugin-ambient-video/releases/tag/v1.0.0 （`demo-6-26s.mp4` 为演示视频） |
+| Release + 演示视频资产 | https://github.com/Gitlandfor/dsh-plugin-ambient-video/releases/tag/v1.0.0 （`demo.mp4` 为演示视频） |

@@ -9,7 +9,7 @@ This repo is a DSH web-profile plugin package: the host half registers the `/pla
 ## Demo
 
 - **Release v1.0.0**: https://github.com/Gitlandfor/dsh-plugin-ambient-video/releases/tag/v1.0.0
-- **`demo-6-26s.mp4` — demo video** (a 6–26s clip of a screen recording showing the frosted-glass backdrop + play/stop/search): open the Release link → Assets → preview/download `demo-6-26s.mp4`.
+- **`demo.mp4` — demo video** (effect showcase): open the Release link → Assets → preview/download `demo.mp4`.
 
 ## Features
 
@@ -84,4 +84,4 @@ Restart `dsh web` (`systemctl --user restart dsh-web` or your usual way) and har
 |---|---|
 | Repository | https://github.com/Gitlandfor/dsh-plugin-ambient-video |
 | Version | v1.0.0 (MIT) |
-| Release + demo asset | https://github.com/Gitlandfor/dsh-plugin-ambient-video/releases/tag/v1.0.0 (`demo-6-26s.mp4` is the demo video) |
+| Release + demo asset | https://github.com/Gitlandfor/dsh-plugin-ambient-video/releases/tag/v1.0.0 (`demo.mp4` is the demo video) |
