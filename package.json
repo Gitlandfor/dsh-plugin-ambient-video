@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-ambient-video",
-  "version": "1.0.0",
-  "description": "氛围背景视频（DSH Ambient Background Video）：Bilibili/YouTube/任意链接全屏毛玻璃背景 + 声卡状态循环；命令 /playurl /playstop /playsearch(国内) /playsearchw(外网)",
+  "version": "1.1.0",
+  "description": "氛围背景视频（DSH Ambient Background Video）：Bilibili/YouTube/本地视频/直播(B站+Twitch)/Jellyfin + B站收藏AI推荐；原生<video>解码 + iframe嵌入 + 声卡循环；命令 /playurl /playstop /playsearch /playsearchw /playlocal /playlive /playask",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -28,7 +28,12 @@
     "video",
     "bilibili",
     "youtube",
+    "twitch",
+    "jellyfin",
+    "local-video",
+    "live-stream",
     "frosted-glass",
+    "ai-recommend",
     "web"
   ],
   "homepage": "https://github.com/Gitlandfor/dsh-plugin-ambient-video"
