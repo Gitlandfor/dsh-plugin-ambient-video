@@ -19,9 +19,12 @@
 ## 环境要求
 
 - DSH web profile（持久插件机制）
+- **dsh-free-search**（peer 依赖，提供 web 搜索/抓取服务；profile bundle 里需有它）
 - **Linux + PipeWire/PulseAudio**（需要 `pactl`）→ 声卡循环
 - 浏览器能访问 bilibili.com / youtube.com（YouTube 需要网络可达，例如有代理）
 - 可选：本地代理（如 Clash 的 `127.0.0.1:7897`）用于外网搜索（设置页可改；国内搜索不依赖代理）
+
+> 系统其它依赖：`curl`（搜索/取流）、`pactl`（声卡检测）。代码运行时只通过 DSH 服务（commands/webServer/shell/timer/web）取能力，无 npm 运行时依赖。
 
 ## 安装
 

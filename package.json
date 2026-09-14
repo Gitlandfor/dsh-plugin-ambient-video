@@ -15,6 +15,10 @@
       "platform": "web"
     }
   },
+  "peerDependencies": {
+    "dsh-free-search": ">=0.4.0",
+    "react": ">=18"
+  },
   "keywords": [
     "deepseek-harness",
     "dsh",
@@ -27,5 +31,5 @@
     "frosted-glass",
     "web"
   ],
-  "homepage": "https://github.com/vilm/dsh-plugin-ambient-video"
+  "homepage": "https://github.com/Gitlandfor/dsh-plugin-ambient-video"
 }
