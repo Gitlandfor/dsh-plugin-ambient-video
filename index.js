@@ -198,8 +198,17 @@ function apply(ctx) {
     } catch (e) { return null }
   }
 
+  // 扫描多个候选路径找 vendor 目录（DSH 模块加载器可能重写 import.meta.url）
   let vendorDir = null
-  try { vendorDir = new URL('.', import.meta.url).pathname } catch (e) { vendorDir = null }
+  const home = os.homedir()
+  const candidates = [
+    (() => { try { return new URL('.', import.meta.url).pathname } catch (e) { return null } })(),
+    path.join(home, '.dsh', 'profiles', 'web', 'plugins', 'dsh-plugin-ambient-video'),
+    path.join(home, '.dsh', 'profiles', 'web', 'node_modules', 'dsh-plugin-ambient-video'),
+  ]
+  for (const c of candidates) {
+    if (c && fs.existsSync(path.join(c, 'hls.min.js'))) { vendorDir = c; break }
+  }
 
   // HTTP Range 流式响应（本地 <video> 拖动进度条必需）
   function serveFile(req, res, filePath, mime, extraHeaders) {
@@ -496,14 +505,14 @@ function apply(ctx) {
     // ---- vendor 静态文件（hls.js/flv.js）----
     const offVendor = webServer.register({
       kind: 'prefix',
-      path: '/ambient-vendor/',
+      path: '/ambient-vendor',
       handler: (req, res) => {
         try {
           const u = new URL(req.url || '/', 'http://internal')
           const name = path.basename(u.pathname || '')
-          if (!/^(hls|flv)\.min\.js$/.test(name) || !vendorDir) { try { res.writeHead(404); res.end() } catch (e) {} return }
+          if (!/^(hls|flv)\.min\.js$/.test(name) || !vendorDir) { try { res.writeHead(404, {'Content-Type':'application/json'}); res.end(JSON.stringify({debug:'no-vendorDir',vendorDir,name})) } catch (e) {} return }
           const f = path.join(vendorDir, name)
-          if (!fs.existsSync(f)) { try { res.writeHead(404); res.end() } catch (e) {} return }
+          if (!fs.existsSync(f)) { try { res.writeHead(404, {'Content-Type':'application/json'}); res.end(JSON.stringify({debug:'file-not-found',path:f,name})) } catch (e) {} return }
           res.writeHead(200, { 'Content-Type': 'application/javascript', 'Cache-Control': 'no-store' })
           fs.createReadStream(f).pipe(res)
         } catch (e) { try { res.writeHead(500); res.end() } catch (e2) {} }
@@ -523,9 +532,9 @@ function apply(ctx) {
       }
       const cmd = 'curl -s --max-time 15 -X ' + method + ' -H ' + JSON.stringify('X-Emby-Token: ' + jf.token) +
         ' -H ' + JSON.stringify('Content-Type: application/json') + dataArg + ' ' + JSON.stringify(jf.server.replace(/\/+$/, '') + apiPath)
-      if (tmpFile) { try { fs.unlinkSync(tmpFile) } catch (e) {} }
       const spec = shell.resolve({ command: cmd, timeoutMs: 20000, stdoutMaxBytes: 2097152 })
       const r = await shell.run(spec)
+      if (tmpFile) { try { fs.unlinkSync(tmpFile) } catch (e) {} }
       if (!r || !r.stdout || !r.stdout.text) return { ok: false, error: 'jf-net' }
       try { return { ok: true, data: JSON.parse(r.stdout.text) } } catch (e) { return { ok: false, error: 'jf-parse' } }
     }
@@ -548,9 +557,9 @@ function apply(ctx) {
             fs.writeFileSync(tmp, JSON.stringify({ Username: user, Pw: pass }))
             const cmd = 'curl -s --max-time 15 -X POST -H ' + JSON.stringify('X-Emby-Authorization: MediaBrowser Client="dsh-ambient", Device="dsh-web-browser", DeviceId="dsh-ambient-001", Version="1.0.0"') +
               " -H 'Content-Type: application/json' -d '@" + tmp + "' " + JSON.stringify(server + '/Users/AuthenticateByName')
-            try { fs.unlinkSync(tmp) } catch (e) {}
             const spec = shell.resolve({ command: cmd, timeoutMs: 20000, stdoutMaxBytes: 1048576 })
             const r = await shell.run(spec)
+            try { fs.unlinkSync(tmp) } catch (e) {}
             const d = JSON.parse(r && r.stdout ? (r.stdout.text || '{}') : '{}')
             if (!d || !d.AccessToken || !d.User) { json(res, { ok: false, error: 'auth-fail' }); return }
             jf = { server, token: String(d.AccessToken), userId: String(d.User.Id), userName: String(d.User.Name || user) }
