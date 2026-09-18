@@ -7,6 +7,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import crypto from 'node:crypto'
+import http from 'node:http'
+import https from 'node:https'
 
 const VIDEO_EXTS = new Set(['.mp4', '.webm', '.ogg', '.ogv', '.mov', '.m4v', '.mkv', '.ts', '.m2ts', '.mts', '.avi', '.flv'])
 const MIME = {
@@ -424,6 +426,93 @@ function apply(ctx) {
     })
     ctx.effect(() => offLocal)
 
+    // ---- B站 VOD 直链解析 ?bvid= &page= → {url: durl mp4 直链, duration, title}（fnval=1 老式 durl，480P 匿名可拿）----
+    let playurlCache = { at: 0, key: '', url: '', duration: 0, title: '' }
+    const offPlayurl = webServer.register({
+      kind: 'exact',
+      path: '/ambient-playurl',
+      handler: async (req, res) => {
+        try {
+          const u = new URL(req.url || '/', 'http://internal')
+          const bvid = String(u.searchParams.get('bvid') || '')
+          const page = Number(u.searchParams.get('page') || '1') || 1
+          if (!/^BV[0-9A-Za-z]+$/.test(bvid)) { json(res, { ok: false, error: 'bad-bvid' }); return }
+          const key = bvid + '|' + page
+          if (playurlCache.key === key && Date.now() - playurlCache.at < 15000) {
+            json(res, { ok: true, url: playurlCache.url, duration: playurlCache.duration, title: playurlCache.title, cached: true })
+            return
+          }
+          if (!shell) { json(res, { ok: false, error: 'no-shell' }); return }
+          // view API 拿 cid（与 /ambient-info 同款：web/curl 双源）
+          const viewUrl = 'https://api.bilibili.com/x/web-interface/view?bvid=' + encodeURIComponent(bvid)
+          let vText = ''
+          if (web) { try { const r = await web.fetch({ url: viewUrl }); vText = r && r.body ? String(r.body.content || '') : '' } catch (e) { vText = '' } }
+          if (!vText) {
+            const vSpec = shell.resolve({ command: 'curl -s --max-time 12 ' + JSON.stringify(viewUrl), timeoutMs: 15000, stdoutMaxBytes: 524288 })
+            const vr = await shell.run(vSpec)
+            if (vr && vr.stdout) vText = vr.stdout.text || ''
+          }
+          const vd = JSON.parse(vText)
+          if (!vd || vd.code !== 0 || !vd.data) { json(res, { ok: false, error: 'view-api:' + String(vd && vd.code) }); return }
+          let cid = Number(vd.data.cid) || 0
+          if (page > 1 && Array.isArray(vd.data.pages)) {
+            const pg = vd.data.pages.find((x) => Number(x.page) === page)
+            if (pg && Number(pg.cid)) cid = Number(pg.cid)
+          }
+          if (!cid) { json(res, { ok: false, error: 'no-cid' }); return }
+          // playurl API fnval=1 拿 durl mp4 直链；qn=32(480P) 匿名即可
+          const puUrl = 'https://api.bilibili.com/x/player/playurl?bvid=' + encodeURIComponent(bvid) + '&cid=' + cid + '&qn=16&fnval=1&fnver=0'
+          const puSpec = shell.resolve({ command: 'curl -s --max-time 12 -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36" -H "Referer: https://www.bilibili.com/" ' + JSON.stringify(puUrl), timeoutMs: 15000, stdoutMaxBytes: 2097152 })
+          const pur = await shell.run(puSpec)
+          const pd = JSON.parse(pur && pur.stdout ? (pur.stdout.text || '{}') : '{}')
+          if (!pd || pd.code !== 0 || !pd.data || !pd.data.durl || !pd.data.durl.length) { json(res, { ok: false, error: 'playurl-api:' + String(pd && pd.code) }); return }
+          const url = String(pd.data.durl[0].url || '')
+          if (!url) { json(res, { ok: false, error: 'no-durl' }); return }
+          playurlCache = { at: Date.now(), key, url, duration: Number(vd.data.duration) || 0, title: String(vd.data.title || '') }
+          json(res, { ok: true, url, duration: playurlCache.duration, title: playurlCache.title })
+        } catch (e) { json(res, { ok: false, error: 'playurl-fail' }) }
+      },
+    })
+    ctx.effect(() => offPlayurl)
+
+    // ---- B站直链代理转发 ?url= （upos CDN 强制 Referer: bilibili.com，浏览器 <video> 不能自定义 → 必须经 Host 转发；支持 Range）----
+    const offProxy = webServer.register({
+      kind: 'exact',
+      path: '/ambient-proxy',
+      handler: (req, res) => {
+        try {
+          const u = new URL(req.url || '/', 'http://internal')
+          const target = String(u.searchParams.get('url') || '')
+          // 白名单：只允许 bilibili 的 CDN 域名（防 SSRF）
+          const m = target.match(/^https?:\/\/([^/]+)/)
+          if (!m || !/(^|\.)(bilivideo\.com|bilibili\.com|hdslb\.com)$/i.test(m[1])) {
+            try { res.writeHead(403, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'domain-not-allowed' })) } catch (e) {}
+            return
+          }
+          // 用 http/https 模块转发（带 Referer/UA + Range），数据流式 pipe
+          const mod = target.startsWith('https:') ? https : http
+          const parsed = new URL(target)
+          const headers = {
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+            'Referer': 'https://www.bilibili.com/',
+          }
+          if (req.headers.range) headers['Range'] = req.headers.range
+          const out = mod.request({
+            hostname: parsed.hostname, port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+            path: parsed.pathname + parsed.search, method: 'GET', headers,
+          }, (up) => {
+            res.writeHead(up.statusCode || 502, up.headers)
+            up.pipe(res)
+          })
+          out.on('error', () => { try { res.writeHead(502); res.end() } catch (e) {} })
+          out.end()
+        } catch (e) {
+          try { res.writeHead(500); res.end('proxy-err') } catch (e2) {}
+        }
+      },
+    })
+    ctx.effect(() => offProxy)
+
     // ---- 本地目录列表 ?dir= ----
     const offList = webServer.register({
       kind: 'exact',
@@ -461,7 +550,7 @@ function apply(ctx) {
           if (!/^\d+$/.test(room)) { json(res, { ok: false, error: 'bad-room' }); return }
           if (liveCache.room === room && Date.now() - liveCache.at < 15000) { json(res, { ok: true, url: liveCache.url, format: liveCache.format, title: liveCache.title }); return }
           const runOnce = async () => {
-            const cmd = 'curl -s --max-time 5 -c /tmp/amb_live_ck.txt -o /dev/null https://live.bilibili.com/ && curl -s --max-time 10 -b /tmp/amb_live_ck.txt -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36" -H "Referer: https://live.bilibili.com/" "https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?room_id=' + room + '&protocol=0,1&format=0,1,2&codec=0,1&qn=10000&platform=h5&ptype=8"'
+            const cmd = 'curl -s --max-time 5 -c /tmp/amb_live_ck.txt -o /dev/null https://live.bilibili.com/ && curl -s --max-time 10 -b /tmp/amb_live_ck.txt -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36" -H "Referer: https://live.bilibili.com/" "https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?room_id=' + room + '&protocol=0,1&format=0,1,2&codec=0,1&qn=150&platform=h5&ptype=8"'
             const spec = shell.resolve({ command: cmd, timeoutMs: 16000, stdoutMaxBytes: 2097152 })
             const r = await shell.run(spec)
             try {
@@ -478,7 +567,7 @@ function apply(ctx) {
                     const cname = String(c.codec_name || '')
                     const urls = Array.isArray(c.url_info) ? c.url_info : []
                     for (const ui of urls) {
-                      const full = String(ui.host || '') + String(ui.base_url || '') + String(ui.extra || '')
+                      const full = String(ui.host || '').replace(/\/+$/, '') + String(c.base_url || '') + String(ui.extra || '')
                       if (!full || cname !== 'avc') continue // 只挑 h264 保证浏览器能解
                       const score = (proto === 'http_hls' ? 2 : 1) + (String(f.format_name || '') === 'fmp4' ? 0.5 : 0)
                       if (!best || score > best.score) best = { score, url: full, format: proto === 'http_hls' ? 'hls' : 'flv' }
@@ -915,6 +1004,93 @@ print(json.dumps(out))\n')
 
   // ---- 命令 ----
   if (commands) {
+    // ---- AI 标识辅助：/playsearch AI 与 /playsearchw AI 共用 ----
+    // 多结果国外搜索（YouTube 优先）
+    const tryWebList = async (q, ms) => {
+      if (!web) return []
+      let timer = null
+      try {
+        const res = await Promise.race([
+          web.search({ query: q, maxResults: 10 }),
+          new Promise((resolve) => { timer = setTimeout(() => resolve(null), ms || 4000) }),
+        ])
+        if (!res || !res.sources) return []
+        const out = []
+        for (const s of res.sources) {
+          const u = String(s.url || '')
+          const y = u.match(/youtube\.com\/watch\?.*?v=([\w-]{6,})/) || u.match(/youtu\.be\/([\w-]{6,})/)
+          if (y) { out.push({ site: 'yt', vid: y[1], title: String(s.title || '') }); continue }
+          const b = u.match(/bilibili\.com\/video\/(BV[0-9A-Za-z]+)/)
+          if (b) out.push({ site: 'bili', bvid: b[1], title: String(s.title || '') })
+        }
+        return out
+      } catch (e) { return [] } finally { if (timer) clearTimeout(timer) }
+    }
+    // AI 从收藏推荐（/playsearch AI <描述>）
+    async function aiFavRecommend(desc) {
+      if (!aiEnabled) return { kind: 'error', text: 'AI 模式未启用（设置→AI 推荐需打开并配置端点）。可用普通搜索，或先配置 AI。' }
+      const items = await loadFavItems(40)
+      if (!items.length) return { kind: 'error', text: '无法读取你的B站收藏（Cookie 缺失或失效），请先在设置里读取/粘贴 Cookie' }
+      const list = items.map((it, i) => (i + 1) + '. 「' + it.title + '」 UP:' + it.up + ' 时长:' + String(it.duration) + 's BV:' + it.bvid).join('\n')
+      const sys = '你是 B站收藏推荐助手。用户描述需求，你从提供的收藏条目里选出最契合的 1-3 条。只输出 JSON 数组，格式 [{"i":条序号,"reason":"一句话理由"}]，不要输出其它内容。'
+      const msg = await aiChat([
+        { role: 'system', content: sys },
+        { role: 'user', content: '用户需求：' + desc + '\n\n我的收藏：\n' + list + '\n\n请给出推荐。' },
+      ])
+      let cards = null
+      const m = msg && msg.match(/\[[\s\S]*?\]/)
+      if (m) {
+        try {
+          const picks = JSON.parse(m[0])
+          if (Array.isArray(picks)) {
+            cards = picks.map((p) => {
+              const it = items[Number(p.i) - 1]
+              return it ? Object.assign({}, it, { reason: String(p.reason || '') }) : null
+            }).filter(Boolean)
+          }
+        } catch (e) { cards = null }
+      }
+      if (!cards || !cards.length) return { kind: 'error', text: 'AI 不可用或未返回结果，请检查设置里的 AI 配置（地址/模型）' }
+      const payload = Buffer.from(JSON.stringify(cards)).toString('base64')
+      await delay()
+      const names = cards.map((c) => '「' + c.title + '」').join('、')
+      return { kind: 'success', text: '🤖 AI 推荐：' + names + '\nCARDS:' + payload }
+    }
+    // AI 国外搜索选片（/playsearchw AI <描述>）
+    async function aiForeignPick(desc) {
+      if (!aiEnabled) return { kind: 'error', text: 'AI 模式未启用（设置→AI 推荐需打开并配置端点）。可用普通搜索，或先配置 AI。' }
+      const srcs = []
+      const a = await searchAnysearch('youtube ' + desc)
+      if (a) srcs.push(a)
+      const wr = await tryWebList('youtube ' + desc, 2500)
+      for (const r of wr) srcs.push(r)
+      if (!srcs.length) return { kind: 'error', text: '没搜到国外结果（' + desc + '），换个描述试试' }
+      const list = srcs.map((it, i) => (i + 1) + '. 「' + it.title + '」 ' + (it.site === 'yt' ? 'yt:' + it.vid : it.bvid)).join('\n')
+      const sys = '你是 YouTube 视频推荐助手。用户描述需求，从候选视频里选最契合的 1-3 条。只输出 JSON 数组，格式 [{"i":条序号,"reason":"一句话理由"}]，不要输出其它内容。'
+      const msg = await aiChat([
+        { role: 'system', content: sys },
+        { role: 'user', content: '用户需求：' + desc + '\n\n候选：\n' + list + '\n\n请给出推荐。' },
+      ])
+      let cards = null
+      const m = msg && msg.match(/\[[\s\S]*?\]/)
+      if (m) {
+        try {
+          const picks = JSON.parse(m[0])
+          if (Array.isArray(picks)) {
+            cards = picks.map((p) => {
+              const it = srcs[Number(p.i) - 1]
+              return it ? Object.assign({}, it, { reason: String(p.reason || '') }) : null
+            }).filter(Boolean)
+          }
+        } catch (e) { cards = null }
+      }
+      if (!cards || !cards.length) return { kind: 'error', text: 'AI 不可用或未返回结果，请检查设置里的 AI 配置（地址/模型）' }
+      const payload = Buffer.from(JSON.stringify(cards)).toString('base64')
+      await delay()
+      const names = cards.map((c) => '「' + c.title + '」').join('、')
+      return { kind: 'success', text: '🤖 AI 推荐：' + names + '\nCARDS:' + payload }
+    }
+
     const offUrl = commands.register({
       name: 'playurl',
       description: '播放/切换背景视频：/playurl <链接|本地路径|live:房间号|twitch:频道>',
@@ -940,14 +1116,18 @@ print(json.dumps(out))\n')
 
     const offSearch = commands.register({
       name: 'playsearch',
-      description: '国内搜索（B站优先）并播放第一个结果：/playsearch <关键词>',
-      input: { hint: '<关键词>' },
+      description: '国内搜索并播放：/playsearch <关键词>；AI 推荐：/playsearch AI <描述>（从B站收藏选片）',
+      input: { hint: '<关键词 或 AI <描述>>' },
       handler: async (invocation) => {
-        const kw = String(invocation.rawInput || '').trim()
-        if (!kw) return { kind: 'error', text: '请提供搜索关键词：/playsearch <关键词>' }
-        const found = await withTimeout5(searchVideo(kw, 'domestic'))
+        const raw = String(invocation.rawInput || '').trim()
+        if (!raw) return { kind: 'error', text: '请提供关键词：/playsearch <关键词> 或 /playsearch AI <描述>' }
+        if (/^ai\s+/i.test(raw)) {
+          const desc = raw.replace(/^ai\s+/i, '').trim() || '随便挑一条适合做工作背景的视频'
+          return await aiFavRecommend(desc)
+        }
+        const found = await withTimeout5(searchVideo(raw, 'domestic'))
         if (found && found.timeout) return { kind: 'error', text: '国内搜索超时（>5秒），请重试或直接 /playurl <链接>' }
-        if (!found) return { kind: 'error', text: '没搜到国内视频结果（' + kw + '），换个关键词或直接 /playurl <链接>' }
+        if (!found) return { kind: 'error', text: '没搜到国内视频结果（' + raw + '），换个关键词或直接 /playurl <链接>' }
         await delay()
         const label = found.site === 'yt' ? ('yt:' + found.vid) : found.bvid
         return { kind: 'success', text: '已搜索到：' + (found.title || '搜索结果') + '（' + label + '）' }
@@ -957,14 +1137,18 @@ print(json.dumps(out))\n')
 
     const offSearchW = commands.register({
       name: 'playsearchw',
-      description: '外网搜索（油管优先，走代理）并播放第一个结果：/playsearchw <关键词>',
-      input: { hint: '<关键词>' },
+      description: '外网搜索并播放：/playsearchw <关键词>；AI 选片：/playsearchw AI <描述>（国外结果AI挑选）',
+      input: { hint: '<关键词 或 AI <描述>>' },
       handler: async (invocation) => {
-        const kw = String(invocation.rawInput || '').trim()
-        if (!kw) return { kind: 'error', text: '请提供搜索关键词：/playsearchw <关键词>' }
-        const found = await withTimeout5(searchVideo(kw, 'foreign'))
+        const raw = String(invocation.rawInput || '').trim()
+        if (!raw) return { kind: 'error', text: '请提供关键词：/playsearchw <关键词> 或 /playsearchw AI <描述>' }
+        if (/^ai\s+/i.test(raw)) {
+          const desc = raw.replace(/^ai\s+/i, '').trim() || 'YouTube 上适合做背景的视频'
+          return await aiForeignPick(desc)
+        }
+        const found = await withTimeout5(searchVideo(raw, 'foreign'))
         if (found && found.timeout) return { kind: 'error', text: '外网搜索超时（>5秒），请重试或直接 /playurl <链接>' }
-        if (!found) return { kind: 'error', text: '没搜到外网视频结果（' + kw + '），换个关键词或直接 /playurl <链接>' }
+        if (!found) return { kind: 'error', text: '没搜到外网视频结果（' + raw + '），换个关键词或直接 /playurl <链接>' }
         await delay()
         const label = found.site === 'yt' ? ('yt:' + found.vid) : found.bvid
         return { kind: 'success', text: '已搜索到：' + (found.title || '搜索结果') + '（' + label + '）' }
@@ -972,77 +1156,6 @@ print(json.dumps(out))\n')
     })
     ctx.effect(() => offSearchW)
 
-    const offLocal = commands.register({
-      name: 'playlocal',
-      description: '播放本地视频：/playlocal <绝对路径或 ~/路径>（MP4/WebM 直播，MKV 自动转封装，HEVC 需 Jellyfin）',
-      input: { hint: '<本地路径>' },
-      handler: async (invocation) => {
-        const raw = String(invocation.rawInput || '').trim()
-        if (!raw) return { kind: 'error', text: '请提供本地路径：/playlocal <路径>' }
-        await delay()
-        return { kind: 'success', text: '已切换到本地视频：' + raw }
-      },
-    })
-    ctx.effect(() => offLocal)
-
-    const offLive = commands.register({
-      name: 'playlive',
-      description: '播放直播：/playlive <B站房间号|直播间链接|twitch:频道名>',
-      input: { hint: '<房间号或 twitch:频道>' },
-      handler: async (invocation) => {
-        const raw = String(invocation.rawInput || '').trim()
-        if (!raw) return { kind: 'error', text: '请提供直播间：/playlive <B站房间号|twitch:频道>' }
-        await delay()
-        return { kind: 'success', text: '已切换到直播：' + raw }
-      },
-    })
-    ctx.effect(() => offLive)
-
-    // /playask：AI 从 B站收藏里推荐（AI 端点由设置页选择；不可用则随机兜底）
-    const offAsk = commands.register({
-      name: 'playask',
-      description: 'AI 从你的B站收藏里推荐播放：/playask <想要的调性/关键词>',
-      input: { hint: '<描述>' },
-      handler: async (invocation) => {
-        const q = String(invocation.rawInput || '').trim()
-        const useAsk = q || '随便挑一条适合做工作背景的视频'
-        const items = await loadFavItems(40)
-        if (!items.length) return { kind: 'error', text: '无法读取你的B站收藏（Cookie 缺失或失效），请先在设置里读取/粘贴 Cookie' }
-        let cards = null
-        let via = ''
-        if (aiEnabled) {
-          const list = items.map((it, i) => (i + 1) + '. 「' + it.title + '」 UP:' + it.up + ' 时长:' + String(it.duration) + 's BV:' + it.bvid).join('\n')
-          const sys = '你是 B站收藏推荐助手。用户描述需求，你从提供的收藏条目里选出最契合的 1-3 条。只输出 JSON 数组，格式 [{"i":条序号,"reason":"一句话理由"}]，不要输出其它内容。'
-          const msg = await aiChat([
-            { role: 'system', content: sys },
-            { role: 'user', content: '用户需求：' + useAsk + '\n\n我的收藏：\n' + list + '\n\n请给出推荐。' },
-          ])
-          const m = msg && msg.match(/\[[\s\S]*?\]/)
-          if (m) {
-            try {
-              const picks = JSON.parse(m[0])
-              if (Array.isArray(picks)) {
-                cards = picks.map((p) => {
-                  const it = items[Number(p.i) - 1]
-                  return it ? Object.assign({}, it, { reason: String(p.reason || '') }) : null
-                }).filter(Boolean)
-              }
-            } catch (e) { cards = null }
-          }
-          via = 'AI'
-        }
-        if (!cards || !cards.length) {
-          const it = items[Math.floor(Math.random() * items.length)]
-          cards = [Object.assign({}, it, { reason: '随机兜底（AI 未开或不可达）' })]
-          via = 'random'
-        }
-        const payload = Buffer.from(JSON.stringify(cards)).toString('base64')
-        await delay()
-        const names = cards.map((c) => '「' + c.title + '」').join('、')
-        return { kind: 'success', text: (via === 'AI' ? '🤖 AI 推荐：' : '🎲 随机兜底：') + names + '\nCARDS:' + payload }
-      },
-    })
-    ctx.effect(() => offAsk)
   }
 }
 

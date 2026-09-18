@@ -19,7 +19,7 @@ window.__ModuleLoader__.load({
 					if (!raw) return {};
 					const p = JSON.parse(raw);
 					const out = {};
-					for (const k of ["draft","opacity","brightness","blur","danmaku","mute","loop","proxy","localRoot","cookie","cookieSource","jfServer","jfUser","jfPass","aiEnabled","aiBase","aiModel","aiKey"]) {
+					for (const k of ["draft","opacity","brightness","blur","mute","loop","proxy","localRoot","cookie","cookieSource","jfServer","jfUser","jfPass","aiEnabled","aiBase","aiModel","aiKey"]) {
 						if (typeof p[k] !== "undefined" && p[k] !== null) out[k] = p[k];
 					}
 					if (typeof out.opacity === "number") out.opacity = Math.min(1, Math.max(0, out.opacity));
@@ -32,7 +32,7 @@ window.__ModuleLoader__.load({
 				try {
 					window.localStorage.setItem(PERSIST_KEY, JSON.stringify({
 						draft: state.draft, opacity: state.opacity, brightness: state.brightness, blur: state.blur,
-						danmaku: state.danmaku, mute: state.mute, loop: state.loop, proxy: state.proxy,
+						mute: state.mute, loop: state.loop, proxy: state.proxy,
 						localRoot: state.localRoot, cookie: state.cookie || "", cookieSource: state.cookieSource || "",
 						jfServer: state.jfServer, jfUser: state.jfUser, jfPass: state.jfPass || "",
 						aiEnabled: !!state.aiEnabled, aiBase: state.aiBase || "", aiModel: state.aiModel || "", aiKey: state.aiKey || "",
@@ -52,7 +52,7 @@ window.__ModuleLoader__.load({
 			// ---- 共享状态 ----
 			let state = Object.assign({
 				draft: "", src: "", site: "", pic: "", playing: false, nonce: 0,
-				opacity: 0.5, brightness: 1.2, blur: 6, danmaku: false, mute: false, loop: true,
+				opacity: 0.5, brightness: 1.2, blur: 6, mute: false, loop: true,
 				proxy: "http://127.0.0.1:7897", localRoot: "", cookie: "", cookieSource: "",
 				jfServer: "", jfUser: "", jfPass: "", jfStatus: "",
 				aiEnabled: true, aiBase: "http://127.0.0.1:8000/v1", aiModel: "", aiKey: "", aiModels: [], aiStatus: "",
@@ -67,32 +67,8 @@ window.__ModuleLoader__.load({
 			const subscribe = (fn) => { listeners.add(fn); return () => { try { listeners.delete(fn) } catch (e) {} }; };
 			const setState = (patch) => { state = Object.assign({}, state, patch); for (const fn of Array.from(listeners)) { try { fn() } catch (e) {} } persist(); };
 
-			// ---- 声卡循环（仅 B站 iframe VOD）----
-			let audioPollDispose = null;
-			let seenSeq = 0;
-			function stopAudioLoop() { if (audioPollDispose) { try { audioPollDispose() } catch (e) {} audioPollDispose = null } }
-			function startAudioLoop() {
-				stopAudioLoop();
-				if (!state.loop || !state.playing || !state.src) return;
-				if (state.site !== "bili") { setState({ loopInfo: "非B站视频：循环由播放器原生处理" }); return }
-				if (state.mute) { setState({ loopInfo: "静音模式：无声卡信号，不循环（需带声音才走声卡循环）" }); return }
-				setState({ loopInfo: "声卡循环：轮询中…（播完自动重播）" });
-				let first = true;
-				const poll = () => {
-					fetch("/ambient-audio-state").then((r) => r.json()).then((d) => {
-						const seq = d && typeof d.restart === "number" ? d.restart : 0;
-						if (first) { seenSeq = seq; first = false; return }
-						if (seq > 0 && seq !== seenSeq) {
-							seenSeq = seq;
-							if (state.playing && state.src) setState({ nonce: state.nonce + 1, loopInfo: "声卡检测：已重播" });
-						}
-					}).catch(() => {});
-				};
-				poll();
-				if (timer) audioPollDispose = timer.interval(poll, 800);
-			}
-			function clearLoopAll() { stopAudioLoop() }
-			if (typeof ctx.effect === "function") ctx.effect(() => () => { clearLoopAll() });
+			// ---- 循环控制（B站 VOD 已迁原生 <video>，用 loop 属性，无需声卡检测）----
+			function clearLoopAll() {}
 
 			function fmtDuration(sec) {
 				sec = Math.floor(Number(sec) || 0);
@@ -156,28 +132,7 @@ window.__ModuleLoader__.load({
 				if (parsed.site === "raw") return parsed.url;
 				if (parsed.site === "yt") return "https://www.youtube-nocookie.com/embed/" + parsed.vid + "?autoplay=1&rel=0&loop=1&playlist=" + parsed.vid;
 				return "https://player.bilibili.com/player.html?bvid=" + parsed.bvid +
-					"&page=" + parsed.page + "&high_quality=1&autoplay=1&mute=" + (state.mute ? 1 : 0) +
-					"&danmaku=" + (state.danmaku ? 1 : 0);
-			}
-
-			function fetchDuration(parsed) {
-				return fetch("/ambient-info/?bvid=" + encodeURIComponent(parsed.bvid) + "&page=" + parsed.page)
-					.then((r) => r.json())
-					.then((r) => {
-						const duration = r && typeof r.duration === "number" ? r.duration : 0;
-						const via = r && r.via ? r.via : "";
-						const err = r && r.error ? r.error : "";
-						let info;
-						if (err) info = "时长获取失败（" + err + "），改用声卡循环";
-						else if (duration > 0) info = "时长 " + fmtDuration(duration) + (via ? "（" + via + "）" : "") + "，循环就绪";
-						else info = "时长获取失败，改用声卡循环";
-						setState({ duration, loopInfo: info, pic: r && r.pic ? String(r.pic) : state.pic });
-						if (state.playing && state.loop) startAudioLoop();
-					})
-					.catch(() => {
-						setState({ duration: 0, loopInfo: "时长接口异常，改用声卡循环" });
-						if (state.playing && state.loop && state.site === "bili" && !state.mute) startAudioLoop();
-					});
+					"&page=" + parsed.page + "&high_quality=1&autoplay=1&mute=" + (state.mute ? 1 : 0);
 			}
 
 			function playLocal(p) {
@@ -207,6 +162,20 @@ window.__ModuleLoader__.load({
 				}).catch(() => { setState({ playing: false, error: "直播接口异常" }); });
 			}
 
+			// B站 VOD 原生播放（playurl 直链 + Host 代理转发 + loop 属性循环）
+			function playBiliVod(parsed) {
+				setState({ src: "", site: "bili", native: true, nativeLoop: true, playing: true, nonce: state.nonce + 1, duration: 0, loopInfo: "B站VOD：正在获取直链…", error: "" });
+				fetch("/ambient-playurl?bvid=" + encodeURIComponent(parsed.bvid) + "&page=" + parsed.page).then((r) => r.json()).then((r) => {
+					if (!r || !r.ok) { setState({ playing: false, error: "B站直链获取失败（" + ((r && r.error) || "") + "）：可能被风控，稍后重试" }); return; }
+					setState({
+						src: "/ambient-proxy?url=" + encodeURIComponent(r.url),
+						native: true, nativeLoop: true, duration: r.duration || 0,
+						loopInfo: "B站VOD（原生480P循环）：" + (r.title || parsed.bvid),
+						error: "",
+					});
+				}).catch(() => { setState({ playing: false, error: "B站直链接口异常" }); });
+			}
+
 			function playTwitch(channel) {
 				const parent = window.location.hostname || "localhost";
 				setState({
@@ -219,11 +188,11 @@ window.__ModuleLoader__.load({
 				const parsed = parseVideo(raw);
 				if (!parsed) { setState({ playing: false, src: "", error: "请先输入链接/路径" }); return; }
 				clearLoopAll();
-				seenSeq = 0;
 				setState({ draft: String(raw || "").trim(), src: "", site: parsed.site, pic: "", playing: true, native: false, nativeLoop: false, liveFormat: "", nonce: state.nonce + 1, duration: 0, probe: "", error: "" });
 				if (parsed.site === "local") { playLocal(parsed.path); return; }
 				if (parsed.site === "live") { playLive(parsed.room); return; }
 				if (parsed.site === "twitch") { playTwitch(parsed.channel); return; }
+				if (parsed.site === "bili") { playBiliVod(parsed); return; }
 				const src = buildSrc(parsed);
 				setState({
 					src,
@@ -231,7 +200,6 @@ window.__ModuleLoader__.load({
 					playing: true,
 					loopInfo: parsed.site === "yt" ? "YouTube 原生循环" : parsed.site === "raw" ? "已按直链嵌入播放" : "正在获取时长…",
 				});
-				if (parsed.site === "bili") fetchDuration(parsed);
 			}
 
 			// Jellyfin 播放：Host 组装带 token 的 HLS 地址
@@ -247,8 +215,7 @@ window.__ModuleLoader__.load({
 
 			function pause() {
 				clearLoopAll();
-				seenSeq = 0;
-				setState({ playing: false, loopInfo: "已暂停（再次输入链接会从头播放）", error: "" });
+				setState({ src: "", playing: false, loopInfo: "已暂停（再次输入链接会从头播放）", error: "" });
 			}
 
 			function useStore() {
@@ -338,7 +305,7 @@ window.__ModuleLoader__.load({
 				return React.createElement("div", { style },
 					React.createElement("iframe", {
 						key: "ambient-" + s.nonce, src: s.src, title: "背景视频", allow: "autoplay; encrypted-media", tabIndex: -1,
-						style: { width: "120vw", height: "calc(67.5vw + 45vh)", marginLeft: "-10vw", marginTop: "-22.5vh", border: 0, display: "block" },
+						style: { width: "100%", height: "100%", border: 0, display: "block" },
 					})
 				);
 			}
@@ -380,14 +347,11 @@ window.__ModuleLoader__.load({
 				const y = t.match(/yt:([\w-]{6,})/);
 				if (y) play("https://www.youtube.com/watch?v=" + y[1]);
 			});
-			const PlayLocalRow = makeCommandRow((node) => { const u = String(node.args || "").trim(); if (u) play(u); });
-			const PlayLiveRow = makeCommandRow((node) => { const u = String(node.args || "").trim(); if (u) { if (/^\d+$/.test(u)) play("live:" + u); else play(u); } });
-
 			// ---- 通用小组件 ----
-			const row = { display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" };
-			const labelStyle = { color: "var(--dsw-alias-label-primary)", fontSize: 13, whiteSpace: "nowrap" };
-			const subStyle = { color: "var(--dsw-alias-label-secondary)", fontSize: 12, paddingLeft: 22 };
-			const sectionTitle = { color: "var(--dsw-alias-label-primary)", fontSize: 14, fontWeight: 600, marginTop: 8 };
+			const row = { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", width: "100%" };
+			const labelStyle = { color: "var(--dsh-alias-label-primary)", fontSize: 13, whiteSpace: "nowrap", flexShrink: 0 };
+			const subStyle = { color: "var(--dsw-alias-label-secondary)", fontSize: 12, paddingLeft: 0, marginTop: 3 };
+			const sectionTitle = { color: "var(--dsh-alias-label-primary)", fontSize: 14, fontWeight: 600, marginTop: 18, paddingTop: 10, borderTop: "0.5px solid var(--dsh-alias-border-l3)" };
 
 			function cardGrid(items, onClick, getImg, getSub) {
 				return React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))", gap: 10, maxWidth: 720 } },
@@ -406,8 +370,8 @@ window.__ModuleLoader__.load({
 				);
 			}
 
-			// /playask 结果行：CARDS: <base64> → 渲染推荐卡片
-			function PlayAskRow(props) {
+			// 搜索结果行（普通搜索直接播 / AI 模式 CARDS 卡片）：playsearch 与 playsearchw 共用
+			function AskResultRow(props) {
 				const node = props && props.node;
 				const [cards, setCards] = React.useState(null);
 				const [phase, setPhase] = React.useState("idle");
@@ -426,10 +390,10 @@ window.__ModuleLoader__.load({
 					const b = t.match(/BV[0-9A-Za-z]{10}/);
 					if (b) play(b[0]);
 				}, [node]);
-				const header = !node ? "" : phase === "exec" ? "⏳ AI 推荐中…" : phase === "err" ? "❌ " + (node.outcome.text || "失败") : phase === "cards" ? "🤖 点卡片播放：" : "▶ " + (node.outcome.text || "完成");
+				const header = !node ? "" : phase === "exec" ? "⏳ 执行中…" : phase === "err" ? "❌ " + (node.outcome.text || "失败") : phase === "cards" ? "🤖 点卡片播放：" : "▶ " + (node.outcome.text || "完成");
 				return React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 8, padding: "4px 0" } },
 					React.createElement("div", { style: { fontSize: 12, color: "var(--dsw-alias-label-secondary)", fontFamily: "var(--ds-font-family-code, monospace)", overflowWrap: "anywhere" } },
-						"/playask" + (node && node.args ? " " + node.args : "")),
+						"/" + (node && node.name ? node.name : "") + (node && node.args ? " " + node.args : "")),
 					React.createElement("div", { style: { fontSize: 12, color: phase === "err" ? "var(--dsw-alias-state-error-primary)" : "var(--dsw-alias-label-secondary)" } }, header),
 					cards && cards.length ? cardGrid(cards, (it) => play(it.bvid), (it) => it.pic, (it) => fmtDuration(it.duration) + (it.reason ? " · " + it.reason : "")) : null
 				);
@@ -441,7 +405,7 @@ window.__ModuleLoader__.load({
 				return React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 14, maxWidth: 720, padding: "4px 2px" } },
 					React.createElement("div", { style: { color: "var(--dsw-alias-label-primary)", fontSize: 15, fontWeight: 600 } }, "氛围背景视频"),
 					React.createElement("div", { style: subStyle },
-						"命令：/playurl <链接|本地路径|live:房间号|twitch:频道>、/playstop、/playlocal <路径>、/playlive <B站房间|twitch:频道>、/playsearch、/playsearchw。设置自动保存。"
+						"命令：/playurl <链接|路径|live:房间号|twitch:频道>、/playsearch <关键词 或 AI <描述>>、/playsearchw <关键词 或 AI <描述>>、/playstop。设置自动保存。"
 					),
 
 					React.createElement("div", { style: row },
@@ -565,6 +529,8 @@ window.__ModuleLoader__.load({
 							placeholder: "用户名", spellCheck: false,
 							style: Object.assign({}, inputBase, { flex: 1, height: 30, padding: "0 10px", fontSize: 12 }),
 						}),
+					),
+					React.createElement("div", { style: row },
 						React.createElement("input", {
 							value: s.jfPass,
 							onChange: (e) => setState({ jfPass: e.target.value }),
@@ -615,13 +581,13 @@ window.__ModuleLoader__.load({
 					React.createElement("div", { style: subStyle }, "点卡片在本插件里原生循环播放（HLS 串流，服务端自动适配转码，HEVC/4K 也能解）。"),
 
 					// ---- AI 推荐 ----
-					React.createElement("div", { style: sectionTitle }, "🤖 AI 推荐（/playask 入口）"),
+					React.createElement("div", { style: sectionTitle }, "🤖 AI 推荐（/playsearch AI 入口）"),
 					React.createElement("label", { style: row },
 						React.createElement("input", {
 							type: "checkbox", checked: !!s.aiEnabled,
 							onChange: (e) => setState({ aiEnabled: e.target.checked }),
 						}),
-						React.createElement("span", { style: labelStyle }, "启用 AI 推荐（关闭则 /playask 随机兜底）")
+						React.createElement("span", { style: labelStyle }, "启用 AI 推荐（关闭则 AI 模式明确报错）")
 					),
 					React.createElement("div", { style: row },
 						React.createElement("span", { style: labelStyle }, "AI 地址"),
@@ -637,7 +603,7 @@ window.__ModuleLoader__.load({
 						React.createElement("input", {
 							value: s.aiModel,
 							onChange: (e) => setState({ aiModel: e.target.value }),
-							placeholder: "如 Qwen3.5-4B-AWQ：/playask 用它选片", spellCheck: false,
+							placeholder: "如 Qwen3.5-4B-AWQ：/playsearch AI 用它选片", spellCheck: false,
 							style: Object.assign({}, inputBase, { flex: 1, height: 30, padding: "0 10px", fontSize: 12 }),
 						}),
 						React.createElement("button", {
@@ -670,7 +636,7 @@ window.__ModuleLoader__.load({
 						}),
 					),
 					s.aiStatus ? React.createElement("div", { style: subStyle }, s.aiStatus) : null,
-					React.createElement("div", { style: subStyle }, "/playask <描述>：从你的B站收藏里 AI 挑片并出卡片；AI 不可达时自动随机兜底。"),
+					React.createElement("div", { style: subStyle }, "/playsearch AI <描述>：从B站收藏 AI 选片出卡片；/playsearchw AI <描述>：国外结果 AI 选片。AI 未配置/失败会明确报错。"),
 
 					// ---- B站收藏 ----
 					React.createElement("div", { style: sectionTitle }, "⭐ B站收藏推荐"),
@@ -778,24 +744,14 @@ window.__ModuleLoader__.load({
 							onChange: (e) => {
 								const loop = e.target.checked;
 								setState({ loop });
-								if (!loop) { clearLoopAll(); seenSeq = 0; setState({ loopInfo: "" }); }
+								if (!loop) { clearLoopAll(); setState({ loopInfo: "" }); }
 								else if (state.playing && state.src) play(state.draft);
 							},
 						}),
 						React.createElement("span", { style: labelStyle }, "单曲循环")
 					),
 					s.loopInfo ? React.createElement("div", { style: subStyle }, "循环状态：" + s.loopInfo) : null,
-					React.createElement("label", { style: row },
-						React.createElement("input", {
-							type: "checkbox", checked: s.danmaku,
-							onChange: (e) => {
-								const danmaku = e.target.checked;
-								setState({ danmaku });
-								if (state.playing && state.src) play(state.draft);
-							},
-						}),
-						React.createElement("span", { style: labelStyle }, "显示弹幕（仅B站VOD）")
-					),
+
 					React.createElement("label", { style: row },
 						React.createElement("input", {
 							type: "checkbox", checked: s.mute,
@@ -833,23 +789,11 @@ window.__ModuleLoader__.load({
 			));
 			slots.inject("conversation.chat.commandview", () => slots.register(
 				{ name: "conversation.chat.commandview", key: "playsearch" },
-				(props) => React.createElement(PlaySearchRow, { node: props && props.node })
+				(props) => React.createElement(AskResultRow, { node: props && props.node })
 			));
 			slots.inject("conversation.chat.commandview", () => slots.register(
 				{ name: "conversation.chat.commandview", key: "playsearchw" },
-				(props) => React.createElement(PlaySearchRow, { node: props && props.node })
-			));
-			slots.inject("conversation.chat.commandview", () => slots.register(
-				{ name: "conversation.chat.commandview", key: "playlocal" },
-				(props) => React.createElement(PlayLocalRow, { node: props && props.node })
-			));
-			slots.inject("conversation.chat.commandview", () => slots.register(
-				{ name: "conversation.chat.commandview", key: "playlive" },
-				(props) => React.createElement(PlayLiveRow, { node: props && props.node })
-			));
-			slots.inject("conversation.chat.commandview", () => slots.register(
-				{ name: "conversation.chat.commandview", key: "playask" },
-				(props) => React.createElement(PlayAskRow, { node: props && props.node })
+				(props) => React.createElement(AskResultRow, { node: props && props.node })
 			));
 		}
 
