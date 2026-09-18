@@ -98,6 +98,11 @@ function apply(ctx) {
   // 最近一次 AI 选卡结果（供客户端轮询 /ambient-ask/state，绕过聊天行渲染时序）
   let askSeq = 0
   let askLast = null
+  // 默认搜索方式：''（空=直接播第一条）/ 'M'（关键词搜索多卡片）/ 'fav'（收藏夹挑选）
+  // 命令不带前缀时走这个值；命令带 M / fav 前缀时优先用前缀
+  let searchMode = ''
+  let mCount = 3        // M 模式返回条数（1-10）
+  const BILI_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 
   // 配置持久化：cookie 等此前只活在内存里，进程一重启就清空，
   // 客户端要等页面重载才回推 → 表现为"cookie 莫名其妙过期"（实测调试重启后 cookieSet 全变 false）。
@@ -127,6 +132,9 @@ function apply(ctx) {
   if (typeof st0.aiKey === 'string') aiKey = st0.aiKey
   const ac0 = Number(st0.aiCount) || 0
   if (ac0 >= 1 && ac0 <= 5) aiCount = ac0
+  const mc0 = Number(st0.mCount) || 0
+  if (mc0 >= 1 && mc0 <= 10) mCount = mc0
+  if (typeof st0.searchMode === 'string' && ['M', 'fav', ''].includes(st0.searchMode)) searchMode = st0.searchMode
   if (typeof st0.reasonEnabled === 'boolean') reasonEnabled = st0.reasonEnabled
   if (typeof st0.reasonProvider === 'string') reasonProvider = st0.reasonProvider
   if (typeof st0.reasonBase === 'string' && st0.reasonBase.trim()) reasonBase = st0.reasonBase.trim().replace(/\/+$/, '')
@@ -372,13 +380,17 @@ function apply(ctx) {
             if (typeof p.aiKey === 'string') aiKey = p.aiKey.trim()
             const ac = Number(p.aiCount) || 3
             if (ac >= 1 && ac <= 5) aiCount = ac
+            const mc = Number(p.mCount) || 3
+            if (mc >= 1 && mc <= 10) mCount = mc
+            const sm = typeof p.searchMode === 'string' ? p.searchMode.trim() : ''
+            if (['M', 'fav', ''].includes(sm)) searchMode = sm
             if (typeof p.reasonEnabled === 'boolean') reasonEnabled = p.reasonEnabled
             if (typeof p.reasonProvider === 'string') reasonProvider = p.reasonProvider.trim()
             if (typeof p.reasonBase === 'string') reasonBase = p.reasonBase.trim().replace(/\/+$/, '')
             if (typeof p.reasonModel === 'string') reasonModel = p.reasonModel.trim()
             if (typeof p.reasonKey === 'string') reasonKey = p.reasonKey.trim()
-            saveState({ cookie: biliCookieStr, cookieSource, aiEnabled, aiProvider, aiBase, aiModel, aiKey, aiCount, reasonEnabled, reasonProvider, reasonBase, reasonModel, reasonKey, proxy: searchProxy, localRoot })
-            json(res, { ok: true, proxy: searchProxy, localRoot, cookieSet: !!biliCookieStr, cookieSource, aiEnabled, aiProvider, aiBase, aiModel, aiSet: !!aiModel, reasonEnabled, reasonProvider, reasonBase, reasonModel })
+            saveState({ cookie: biliCookieStr, cookieSource, aiEnabled, aiProvider, aiBase, aiModel, aiKey, aiCount, mCount, searchMode, reasonEnabled, reasonProvider, reasonBase, reasonModel, reasonKey, proxy: searchProxy, localRoot })
+            json(res, { ok: true, proxy: searchProxy, localRoot, cookieSet: !!biliCookieStr, cookieSource, aiEnabled, aiProvider, aiBase, aiModel, aiSet: !!aiModel, aiCount, mCount, searchMode, reasonEnabled, reasonProvider, reasonBase, reasonModel })
           } catch (e) {
             json(res, { ok: false }, 500)
           }
@@ -1079,6 +1091,92 @@ print(json.dumps(out))\n')
     ctx.effect(() => offCookieRead)
   }
 
+  // ---- 关键词搜索取多条（M 模式用）----
+  // B站搜索接口返回的 duration 是 "MM:SS" / "H:MM:SS" 字符串，卡片展示需要秒数
+  function parseDur(s) {
+    const m = String(s || '').match(/(\d+):(\d{2})(?::(\d{2}))?/)
+    if (!m) return 0
+    return m[3] ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : Number(m[1]) * 60 + Number(m[2])
+  }
+  // B站搜索结果 title 带 <em class="keyword">高亮</em> 标签，卡片展示要剥掉
+  function stripHtml(s) { return String(s || '').replace(/<[^>]+>/g, '').trim() }
+
+  // B站关键词搜索：返回多条（原 searchBiliApi 只取第一条就丢）
+
+  // B站关键词搜索：返回多条（M 模式用）。
+  // 两个坑：
+  //   1) 搜索接口必须 WBI 签名，否则返回「出错啦!」HTML 拦截页（即使带 cookie 也没用）。
+  //   2) 光有 UA + Referer 不够，会被 412 拦；必须补全浏览器请求头
+  //      （Accept / Accept-Language / Origin / Sec-Fetch-*）。收藏接口不挑，搜索接口挑。
+  // 原 searchBiliApi 两项都没做，国内关键词搜索一直是坏的。
+  async function searchBiliApiList(kw, limit) {
+    if (!shell) return []
+    const q = await wbiSign({ search_type: 'video', keyword: kw, order: 'click', page: 1, ps: 20 })
+    const cmd = 'curl -s --max-time 10 ' +
+      '-H "User-Agent: ' + BILI_UA + '" ' +
+      '-H "Referer: https://www.bilibili.com/" ' +
+      '-H "Accept: application/json, text/plain, */*" ' +
+      '-H "Accept-Language: zh-CN,zh;q=0.9" ' +
+      '-H "Origin: https://www.bilibili.com" ' +
+      '-H "Sec-Fetch-Dest: empty" -H "Sec-Fetch-Mode: cors" -H "Sec-Fetch-Site: same-origin" ' +
+      '"https://api.bilibili.com/x/web-interface/search/type?' + q + '"'
+    const spec = shell.resolve({ command: cmd, timeoutMs: 16000, stdoutMaxBytes: 1048576 })
+    const r = await shell.run(spec)
+    try {
+      const data = JSON.parse(r && r.stdout ? (r.stdout.text || '') : '')
+      if (data && data.code === 0 && data.data && Array.isArray(data.data.result)) {
+        return data.data.result
+          .filter((x) => x && typeof x.bvid === 'string' && x.bvid)
+          .slice(0, limit)
+          .map((x) => ({
+            bvid: String(x.bvid),
+            title: stripHtml(x.title),
+            pic: String(x.pic || '').split('@')[0],
+            duration: parseDur(x.duration),
+            up: stripHtml(x.author),
+          }))
+      }
+    } catch (e) {}
+    return []
+  }
+
+  // 外网关键词搜索：返回多条（原 searchAnysearch 只取第一条就丢）
+  async function searchAnysearchList(query, limit) {
+    if (!shell) return []
+    try {
+      const body = JSON.stringify({ query, max_results: 10 })
+      const proxyArg = searchProxy ? " -x " + JSON.stringify(searchProxy) : ''
+      const cmd = "curl -s --max-time 12" + proxyArg + " -X POST https://api.anysearch.com/v1/search -H \"content-type: application/json\" -d '" + body + "'"
+      const spec = shell.resolve({ command: cmd, timeoutMs: 20000, stdoutMaxBytes: 262144 })
+      const r = await shell.run(spec)
+      const data = JSON.parse(r && r.stdout ? (r.stdout.text || '') : '')
+      const results = data && data.data && Array.isArray(data.data.results) ? data.data.results : []
+      return results.slice(0, limit)
+        .map((it) => ({ title: stripHtml(it.title), url: String(it.url || '') }))
+        .filter((x) => x.title && x.url)
+    } catch (e) {}
+    return []
+  }
+
+  // M 模式：关键词搜索 -> 多卡片浮层。复用 AskResultRow 的 CARDS 载荷 + CardOverlay 拖拽播放
+  async function multiSearchCards(kw, foreign) {
+    const n = Math.max(1, Math.min(10, Number(mCount) || 3))
+    let cards = []
+    if (foreign) {
+      const srcs = await searchAnysearchList(kw, n)
+      cards = srcs.map((s) => ({ title: s.title, url: s.url, pic: '', duration: 0, up: '', reason: '' }))
+    } else {
+      const items = await searchBiliApiList(kw, n)
+      cards = items.map((it) => ({ title: it.title, bvid: it.bvid, pic: it.pic, duration: it.duration, up: it.up, reason: '' }))
+    }
+    if (!cards.length) return null
+    await delay()
+    askSeq += 1
+    askLast = { seq: askSeq, cards: cards, query: String(kw || ''), at: Date.now() }
+    const names = cards.map((c) => '\u300c' + c.title + '\u300d').join('\u3001')
+    return { kind: 'success', text: '\ud83d\udd0e 找到 ' + cards.length + ' 条：' + names + '（理由生成中…）\nCARDS:' + Buffer.from(JSON.stringify(cards)).toString('base64') }
+  }
+
   // ---- 搜索结果挑选（VOD，维持 iframe）----
   function pickResult(srcs) {
     for (const s of srcs) {
@@ -1094,26 +1192,8 @@ print(json.dumps(out))\n')
     return null
   }
   async function searchBiliApi(kw) {
-    if (!shell) return null
-    const q = encodeURIComponent(kw)
-    const runOnce = async () => {
-      const cmd = 'curl -s --max-time 5 -c /tmp/bili_ck.txt -o /dev/null https://www.bilibili.com/ && curl -s --max-time 10 -b /tmp/bili_ck.txt -A "Mozilla/5.0" -H "Referer: https://www.bilibili.com/" "https://api.bilibili.com/x/web-interface/search/type?search_type=video&keyword=' + q + '"'
-      const spec = shell.resolve({ command: cmd, timeoutMs: 16000, stdoutMaxBytes: 1048576 })
-      const r = await shell.run(spec)
-      try {
-        const data = JSON.parse(r && r.stdout ? (r.stdout.text || '') : '')
-        if (data && data.code === 0 && data.data && Array.isArray(data.data.result)) {
-          const hit = data.data.result.find((x) => x && typeof x.bvid === 'string' && x.bvid)
-          if (hit) return { site: 'bili', bvid: String(hit.bvid), title: String(hit.title || '') }
-        }
-      } catch (e) { /* retry */ }
-      return null
-    }
-    try {
-      const first = await runOnce()
-      if (first) return first
-      return await runOnce()
-    } catch (e) { return null }
+    const list = await searchBiliApiList(kw, 1)
+    return list.length ? { site: 'bili', bvid: list[0].bvid, title: list[0].title } : null
   }
   async function searchAnysearch(query) {
     if (!shell) return null
@@ -1291,18 +1371,28 @@ print(json.dumps(out))\n')
 
     const offSearch = commands.register({
       name: 'playsearch',
-      description: '国内搜索并播放：/playsearch <关键词>；AI 推荐：/playsearch AI <描述>（从B站收藏选片）',
-      input: { hint: '<关键词 或 AI <描述>>' },
+      description: '国内搜索：/playsearch <关键词> 直接播；M <关键词> 多卡片；fav <描述> 从收藏挑选',
+      input: { hint: '<关键词 | M <关键词> | fav <描述>>' },
       handler: async (invocation) => {
         const raw = String(invocation.rawInput || '').trim()
-        if (!raw) return { kind: 'error', text: '请提供关键词：/playsearch <关键词> 或 /playsearch AI <描述>' }
-        if (/^ai\s+/i.test(raw)) {
-          const desc = raw.replace(/^ai\s+/i, '').trim() || '随便挑一条适合做工作背景的视频'
-          return await aiFavRecommend(desc)
+        if (!raw) return { kind: 'error', text: '用法：/playsearch <关键词> | M <关键词> | fav <描述>' }
+        // 搜索方式：命令前缀优先，不带前缀走设置里的默认值
+        let mode = searchMode || ''
+        let desc = raw
+        if (/^m\s+/i.test(raw)) { mode = 'M'; desc = raw.replace(/^m\s+/i, '').trim() }
+        else if (/^fav\s+/i.test(raw)) { mode = 'fav'; desc = raw.replace(/^fav\s+/i, '').trim() }
+        else if (/^ai\s+/i.test(raw)) {
+          return { kind: 'error', text: '搜索方式 AI 已改名为 fav：/playsearch fav <描述>' }
         }
-        const found = await withTimeout5(searchVideo(raw, 'domestic'))
+        if (!desc) return { kind: 'error', text: '请提供关键词或描述' }
+        if (mode === 'fav') return await aiFavRecommend(desc)
+        if (mode === 'M') {
+          const r = await multiSearchCards(desc, false)
+          return r || { kind: 'error', text: '没搜到国内视频结果（' + desc + '），换个关键词或直接 /playurl <链接>' }
+        }
+        const found = await withTimeout5(searchVideo(desc, 'domestic'))
         if (found && found.timeout) return { kind: 'error', text: '国内搜索超时（>5秒），请重试或直接 /playurl <链接>' }
-        if (!found) return { kind: 'error', text: '没搜到国内视频结果（' + raw + '），换个关键词或直接 /playurl <链接>' }
+        if (!found) return { kind: 'error', text: '没搜到国内视频结果（' + desc + '），换个关键词或直接 /playurl <链接>' }
         await delay()
         const label = found.site === 'yt' ? ('yt:' + found.vid) : found.bvid
         return { kind: 'success', text: '已搜索到：' + (found.title || '搜索结果') + '（' + label + '）' }
@@ -1312,18 +1402,28 @@ print(json.dumps(out))\n')
 
     const offSearchW = commands.register({
       name: 'playsearchw',
-      description: '外网搜索并播放：/playsearchw <关键词>；AI 选片：/playsearchw AI <描述>（国外结果AI挑选）',
-      input: { hint: '<关键词 或 AI <描述>>' },
+      description: '外网搜索：/playsearchw <关键词> 直接播；M <关键词> 多卡片；fav <描述> 从国外候选挑选',
+      input: { hint: '<关键词 | M <关键词> | fav <描述>>' },
       handler: async (invocation) => {
         const raw = String(invocation.rawInput || '').trim()
-        if (!raw) return { kind: 'error', text: '请提供关键词：/playsearchw <关键词> 或 /playsearchw AI <描述>' }
-        if (/^ai\s+/i.test(raw)) {
-          const desc = raw.replace(/^ai\s+/i, '').trim() || 'YouTube 上适合做背景的视频'
-          return await aiForeignPick(desc)
+        if (!raw) return { kind: 'error', text: '用法：/playsearchw <关键词> | M <关键词> | fav <描述>' }
+        // 搜索方式：命令前缀优先，不带前缀走设置里的默认值
+        let mode = searchMode || ''
+        let desc = raw
+        if (/^m\s+/i.test(raw)) { mode = 'M'; desc = raw.replace(/^m\s+/i, '').trim() }
+        else if (/^fav\s+/i.test(raw)) { mode = 'fav'; desc = raw.replace(/^fav\s+/i, '').trim() }
+        else if (/^ai\s+/i.test(raw)) {
+          return { kind: 'error', text: '搜索方式 AI 已改名为 fav：/playsearchw fav <描述>' }
         }
-        const found = await withTimeout5(searchVideo(raw, 'foreign'))
+        if (!desc) return { kind: 'error', text: '请提供关键词或描述' }
+        if (mode === 'fav') return await aiForeignPick(desc)
+        if (mode === 'M') {
+          const r = await multiSearchCards(desc, true)
+          return r || { kind: 'error', text: '没搜到外网视频结果（' + desc + '），换个关键词或直接 /playurl <链接>' }
+        }
+        const found = await withTimeout5(searchVideo(desc, 'foreign'))
         if (found && found.timeout) return { kind: 'error', text: '外网搜索超时（>5秒），请重试或直接 /playurl <链接>' }
-        if (!found) return { kind: 'error', text: '没搜到外网视频结果（' + raw + '），换个关键词或直接 /playurl <链接>' }
+        if (!found) return { kind: 'error', text: '没搜到外网视频结果（' + desc + '），换个关键词或直接 /playurl <链接>' }
         await delay()
         const label = found.site === 'yt' ? ('yt:' + found.vid) : found.bvid
         return { kind: 'success', text: '已搜索到：' + (found.title || '搜索结果') + '（' + label + '）' }

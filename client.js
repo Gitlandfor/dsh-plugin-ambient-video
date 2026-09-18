@@ -19,7 +19,7 @@ window.__ModuleLoader__.load({
 					if (!raw) return {};
 					const p = JSON.parse(raw);
 					const out = {};
-					for (const k of ["draft","opacity","brightness","blur","mute","loop","proxy","localRoot","cookie","cookieSource","jfServer","jfUser","jfPass","aiEnabled","aiBase","aiModel","aiKey","aiCount","reasonEnabled","reasonBase","reasonModel","reasonKey"]) {
+					for (const k of ["draft","opacity","brightness","blur","mute","loop","proxy","localRoot","cookie","cookieSource","jfServer","jfUser","jfPass","aiEnabled","aiBase","aiModel","aiKey","aiCount","mCount","searchMode","reasonEnabled","reasonBase","reasonModel","reasonKey"]) {
 						if (typeof p[k] !== "undefined" && p[k] !== null) out[k] = p[k];
 					}
 					if (typeof out.opacity === "number") out.opacity = Math.min(1, Math.max(0, out.opacity));
@@ -35,7 +35,7 @@ window.__ModuleLoader__.load({
 						mute: state.mute, loop: state.loop, proxy: state.proxy,
 						localRoot: state.localRoot, cookie: state.cookie || "", cookieSource: state.cookieSource || "",
 						jfServer: state.jfServer, jfUser: state.jfUser, jfPass: state.jfPass || "",
-						aiEnabled: !!state.aiEnabled, aiBase: state.aiBase || "", aiModel: state.aiModel || "", aiKey: state.aiKey || "", aiCount: Number(state.aiCount) || 3,
+						aiEnabled: !!state.aiEnabled, aiBase: state.aiBase || "", aiModel: state.aiModel || "", aiKey: state.aiKey || "", aiCount: Number(state.aiCount) || 3, mCount: Number(state.mCount) || 3, searchMode: state.searchMode || "",
 						reasonEnabled: !!state.reasonEnabled, reasonBase: state.reasonBase || "", reasonModel: state.reasonModel || "", reasonKey: state.reasonKey || "",
 					}));
 				} catch (e) { /* ignore */ }
@@ -45,7 +45,7 @@ window.__ModuleLoader__.load({
 					fetch("/ambient-config", {
 						method: "POST",
 						headers: { "Content-Type": "application/json" },
-						body: JSON.stringify({ proxy: state.proxy || "", localRoot: state.localRoot || "", cookie: state.cookie || "", cookieSource: state.cookieSource || "", aiEnabled: !!state.aiEnabled, aiBase: state.aiBase || "", aiModel: state.aiModel || "", aiKey: state.aiKey || "", aiCount: Number(state.aiCount) || 3, reasonEnabled: !!state.reasonEnabled, reasonBase: state.reasonBase || "", reasonModel: state.reasonModel || "", reasonKey: state.reasonKey || "" }),
+						body: JSON.stringify({ proxy: state.proxy || "", localRoot: state.localRoot || "", cookie: state.cookie || "", cookieSource: state.cookieSource || "", aiEnabled: !!state.aiEnabled, aiBase: state.aiBase || "", aiModel: state.aiModel || "", aiKey: state.aiKey || "", aiCount: Number(state.aiCount) || 3, mCount: Number(state.mCount) || 3, searchMode: state.searchMode || "", reasonEnabled: !!state.reasonEnabled, reasonBase: state.reasonBase || "", reasonModel: state.reasonModel || "", reasonKey: state.reasonKey || "" }),
 					}).catch(() => {});
 				} catch (e) { /* ignore */ }
 			}
@@ -56,8 +56,8 @@ window.__ModuleLoader__.load({
 				opacity: 0.5, brightness: 1.2, blur: 6, mute: false, loop: true,
 				proxy: "http://127.0.0.1:7897", localRoot: "", cookie: "", cookieSource: "",
 				jfServer: "", jfUser: "", jfPass: "", jfStatus: "",
-				aiEnabled: true, aiBase: "http://127.0.0.1:8000/v1", aiModel: "", aiKey: "", aiCount: 3, aiModels: [], aiStatus: "",
-				uiOpen: { play: true, display: true, local: false, live: false, jf: false, ai: false, fav: false },
+				aiEnabled: true, aiBase: "http://127.0.0.1:8000/v1", aiModel: "", aiKey: "", aiCount: 3, aiModels: [], aiStatus: "", mCount: 3, searchMode: "",
+				uiOpen: { play: true, display: true, local: false, live: false, jf: false, ai: false, fav: false, sm: true },
 				reasonEnabled: true, reasonBase: "", reasonModel: "", reasonKey: "", reasonModels: [], reasonStatus: "",
 				duration: 0, loopInfo: "", error: "",
 				native: false, nativeLoop: false, liveFormat: "", probe: "",
@@ -421,7 +421,7 @@ window.__ModuleLoader__.load({
 				return React.createElement("div", {
 					key: c.bvid || i,
 					draggable: true,
-					onDragStart: (e) => { e.dataTransfer.setData("text/plain", c.raw || c.bvid || ""); e.dataTransfer.effectAllowed = "copy"; },
+					onDragStart: (e) => { e.dataTransfer.setData("text/plain", c.raw || c.bvid || c.url || ""); e.dataTransfer.effectAllowed = "copy"; },
 					style: { width: 172, height: 229, borderRadius: 10, background: "linear-gradient(#2a2a3a,#16161f)", cursor: "grab", position: "relative", overflow: "hidden", flex: "none", boxSizing: "border-box", boxShadow: "0 6px 18px rgba(0,0,0,.55)", border: "3px solid " + rarity },
 				},
 					c.pic ? React.createElement("img", { src: c.pic, alt: "", draggable: false, referrerPolicy: "no-referrer", onError: (e) => { e.currentTarget.style.display = "none"; }, style: { width: "100%", height: 128, objectFit: "cover", display: "block", pointerEvents: "none" } }) : React.createElement("div", { style: { height: 128, display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center", padding: 10, boxSizing: "border-box", fontSize: 11, color: "#8a8a9a", lineHeight: 1.3 } }, "无封面"),
@@ -609,7 +609,7 @@ window.__ModuleLoader__.load({
 					React.createElement("div", { style: { color: "var(--dsw-alias-label-primary)", fontSize: 15, fontWeight: 600 } }, "氛围背景视频" + (s.uiOpen.play ? " ▾" : " ▸")),
 s.uiOpen.play ? React.createElement("div", null,
 					React.createElement("div", { style: subStyle },
-						"命令：/playurl <链接|路径|live:房间号|twitch:频道>、/playsearch <关键词 或 AI <描述>>、/playsearchw <关键词 或 AI <描述>>、/playstop。设置自动保存。"
+						"命令：/playurl <链接|路径|live:房间号|twitch:频道>、/playsearch <关键词|M 关键词|fav 描述>、/playsearchw <关键词|M 关键词|fav 描述>、/playstop。设置自动保存。"
 					),
 
 					React.createElement("div", { style: row },
@@ -844,9 +844,37 @@ s.uiOpen.jf ? React.createElement("div", null,
 
 					// ---- AI 推荐（选卡 AI 与补理由 AI 分开配置）----
 ) : null,
-					React.createElement("div", { style: Object.assign({}, sectionTitle, { cursor: "pointer", userSelect: "none" }), onClick: () => toggle("ai") }, "🤖 AI 推荐" + (s.uiOpen.ai ? " ▾" : " ▸")),
+									// ---- 搜索方式：默认模式 + M 条数 ----
+				React.createElement("div", { style: Object.assign({}, sectionTitle, { cursor: "pointer", userSelect: "none" }), onClick: () => toggle("sm") }, "🔍 搜索方式" + (s.uiOpen.sm ? " ▾" : " ▸")),
+				s.uiOpen.sm ? React.createElement("div", null,
+					React.createElement("label", { style: row },
+						React.createElement("span", { style: labelStyle }, "默认搜索方式"),
+						React.createElement("select", {
+							value: s.searchMode || "",
+							onChange: (e) => { setState({ searchMode: e.target.value }); syncConfig(); },
+							style: Object.assign({}, inputBase, { height: 28, width: 150, padding: "0 8px", fontSize: 12 }),
+						},
+							React.createElement("option", { value: "" }, "空（直接播第一条）"),
+							React.createElement("option", { value: "M" }, "M（关键词多卡片）"),
+							React.createElement("option", { value: "fav" }, "fav（收藏挑选）")
+						)
+					),
+					React.createElement("label", { style: row },
+						React.createElement("span", { style: labelStyle }, "M 模式条数"),
+						React.createElement("select", {
+							value: String(Number(s.mCount) || 3),
+							onChange: (e) => { setState({ mCount: parseInt(e.target.value, 10) || 3 }); syncConfig(); },
+							style: Object.assign({}, inputBase, { height: 28, width: 80, padding: "0 8px", fontSize: 12 }),
+						},
+						[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => React.createElement("option", { key: n, value: String(n) }, String(n)))
+						)
+					),
+					React.createElement("div", { style: subStyle }, "不带前缀的 /playsearch <关键词> 走这里的默认值；命令里写 M <关键词> 或 fav <描述> 时优先用命令前缀。"),
+					React.createElement("div", { style: subStyle }, "示例：/playsearch M 白噪音 → 搜索结果取前 N 条出卡片；/playsearch fav 安静学习 → 从 B站收藏里挑。"),
+				) : null,
+React.createElement("div", { style: Object.assign({}, sectionTitle, { cursor: "pointer", userSelect: "none" }), onClick: () => toggle("ai") }, "🤖 AI 推荐" + (s.uiOpen.ai ? " ▾" : " ▸")),
 s.uiOpen.ai ? React.createElement("div", null,
-					React.createElement("div", { style: { fontSize: 13, fontWeight: 600, color: "var(--dsh-alias-label-primary)", marginTop: 6 } }, "🎯 选卡 AI（/playsearch AI 选片）"),
+					React.createElement("div", { style: { fontSize: 13, fontWeight: 600, color: "var(--dsh-alias-label-primary)", marginTop: 6 } }, "🎯 收藏挑选 fav（/playsearch fav 选片）"),
 					React.createElement("label", { style: row },
 						React.createElement("input", {
 							type: "checkbox", checked: !!s.aiEnabled,
@@ -961,7 +989,7 @@ s.uiOpen.ai ? React.createElement("div", null,
 						}),
 					),
 					s.reasonStatus ? React.createElement("div", { style: subStyle }, s.reasonStatus) : null,
-					React.createElement("div", { style: subStyle }, "/playsearch AI <描述> 选卡（🎯）；卡片理由逐条生成（✍️）。两套 AI 可分别配置：选卡用快的，理由用好的。"),
+					React.createElement("div", { style: subStyle }, "/playsearch fav <描述> 从收藏选卡（🎯）；/playsearch M <关键词> 搜索多卡片。卡片理由逐条生成（✍️）。两套 AI 可分别配置：选卡用快的，理由用好的。"),
 
 					// ---- B站收藏 ----
 ) : null,
