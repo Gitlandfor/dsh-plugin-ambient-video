@@ -86,6 +86,7 @@ function apply(ctx) {
   let aiModel = ''
   let aiKey = ''
   let aiEnabled = true
+  let aiCount = 3
 
   async function aiModels() {
     if (!shell || !aiBase) return []
@@ -269,6 +270,8 @@ function apply(ctx) {
             if (typeof p.aiBase === 'string' && p.aiBase.trim()) aiBase = p.aiBase.trim().replace(/\/+$/, '')
             if (typeof p.aiModel === 'string') aiModel = p.aiModel.trim()
             if (typeof p.aiKey === 'string') aiKey = p.aiKey.trim()
+            const ac = Number(p.aiCount) || 3
+            if (ac >= 1 && ac <= 5) aiCount = ac
             json(res, { ok: true, proxy: searchProxy, localRoot, cookieSet: !!biliCookieStr, cookieSource, aiEnabled, aiBase, aiModel, aiSet: !!aiModel })
           } catch (e) {
             json(res, { ok: false }, 500)
@@ -439,7 +442,7 @@ function apply(ctx) {
           if (!/^BV[0-9A-Za-z]+$/.test(bvid)) { json(res, { ok: false, error: 'bad-bvid' }); return }
           const key = bvid + '|' + page
           if (playurlCache.key === key && Date.now() - playurlCache.at < 15000) {
-            json(res, { ok: true, url: playurlCache.url, duration: playurlCache.duration, title: playurlCache.title, cached: true })
+            json(res, { ok: true, url: playurlCache.url, duration: playurlCache.duration, title: playurlCache.title, pic: playurlCache.pic || '', cached: true })
             return
           }
           if (!shell) { json(res, { ok: false, error: 'no-shell' }); return }
@@ -468,8 +471,8 @@ function apply(ctx) {
           if (!pd || pd.code !== 0 || !pd.data || !pd.data.durl || !pd.data.durl.length) { json(res, { ok: false, error: 'playurl-api:' + String(pd && pd.code) }); return }
           const url = String(pd.data.durl[0].url || '')
           if (!url) { json(res, { ok: false, error: 'no-durl' }); return }
-          playurlCache = { at: Date.now(), key, url, duration: Number(vd.data.duration) || 0, title: String(vd.data.title || '') }
-          json(res, { ok: true, url, duration: playurlCache.duration, title: playurlCache.title })
+          playurlCache = { at: Date.now(), key, url, duration: Number(vd.data.duration) || 0, title: String(vd.data.title || ''), pic: String(vd.data.pic || '') }
+          json(res, { ok: true, url, duration: playurlCache.duration, title: playurlCache.title, pic: playurlCache.pic })
         } catch (e) { json(res, { ok: false, error: 'playurl-fail' }) }
       },
     })
@@ -789,6 +792,35 @@ function apply(ctx) {
     })
     ctx.effect(() => offAiTest)
 
+    // ---- 单条推荐理由生成（客户端流式逐条补，POST {query, item}）----
+    const offAiReason = webServer.register({
+      kind: 'exact',
+      path: '/ambient-ai/reason',
+      handler: (req, res) => {
+        let body = ''
+        req.on('data', (c) => { body += c })
+        req.on('end', async () => {
+          try {
+            const p = JSON.parse(body || '{}')
+            const query = String(p.query || '').trim() || '适合做背景的视频'
+            const it = p.item || {}
+            const title = String(it.title || '')
+            const up = String(it.up || '')
+            const dur = Number(it.duration || 0)
+            if (!aiEnabled) { json(res, { ok: false, error: 'ai-disabled' }); return }
+            const sys = '你是视频推荐助手，为每条视频写一句 15-25 字的推荐理由，说明它为什么适合作为工作/学习的氛围背景视频。只输出理由本身，不要引号、不要前缀。'
+            const msg = await aiChat([
+              { role: 'system', content: sys },
+              { role: 'user', content: '用户需求：' + query + '\n视频：' + (title || '未知') + '（UP:' + (up || '未知') + '，时长' + Math.round(dur / 60) + '分钟）\n请写推荐理由。' },
+            ], 256)
+            const reason = msg ? String(msg).trim().replace(/^["'“”\s]+|["'“”\s]+$/g, '').slice(0, 120) : ''
+            json(res, { ok: !!reason, reason })
+          } catch (e) { json(res, { ok: false, error: 'fail' }) }
+        })
+      },
+    })
+    ctx.effect(() => offAiReason)
+
     // ---- 浏览器 Cookie 读取 ----
     const offCookieRead = webServer.register({
       kind: 'exact',
@@ -1027,68 +1059,67 @@ print(json.dumps(out))\n')
       } catch (e) { return [] } finally { if (timer) clearTimeout(timer) }
     }
     // AI 从收藏推荐（/playsearch AI <描述>）
+    // 流式 AI：AI 选卡（只输出序号，不写理由→快），先出卡；推荐理由由客户端逐条异步补（/ambient-ai/reason）
     async function aiFavRecommend(desc) {
-      if (!aiEnabled) return { kind: 'error', text: 'AI 模式未启用（设置→AI 推荐需打开并配置端点）。可用普通搜索，或先配置 AI。' }
       const items = await loadFavItems(40)
       if (!items.length) return { kind: 'error', text: '无法读取你的B站收藏（Cookie 缺失或失效），请先在设置里读取/粘贴 Cookie' }
-      const list = items.map((it, i) => (i + 1) + '. 「' + it.title + '」 UP:' + it.up + ' 时长:' + String(it.duration) + 's BV:' + it.bvid).join('\n')
-      const sys = '你是 B站收藏推荐助手。用户描述需求，你从提供的收藏条目里选出最契合的 1-3 条。只输出 JSON 数组，格式 [{"i":条序号,"reason":"一句话理由"}]，不要输出其它内容。'
-      const msg = await aiChat([
-        { role: 'system', content: sys },
-        { role: 'user', content: '用户需求：' + desc + '\n\n我的收藏：\n' + list + '\n\n请给出推荐。' },
-      ])
-      let cards = null
-      const m = msg && msg.match(/\[[\s\S]*?\]/)
-      if (m) {
-        try {
-          const picks = JSON.parse(m[0])
-          if (Array.isArray(picks)) {
-            cards = picks.map((p) => {
-              const it = items[Number(p.i) - 1]
-              return it ? Object.assign({}, it, { reason: String(p.reason || '') }) : null
-            }).filter(Boolean)
-          }
-        } catch (e) { cards = null }
+      let chosen = items.slice(0, aiCount || 3)
+      if (aiEnabled) {
+        const list = items.map((it, i) => (i + 1) + '. 「' + it.title + '」 UP:' + it.up + ' 时长:' + String(it.duration) + 's BV:' + it.bvid).join('\n')
+        const sys = '你是 B站收藏推荐助手。用户描述需求，从收藏条目里选出最契合的 ' + String(aiCount) + ' 条。只输出 JSON 数组，元素为条目序号（如 [3,7,12]），不要输出其它任何内容。'
+        const msg = await aiChat([
+          { role: 'system', content: sys },
+          { role: 'user', content: '用户需求：' + desc + '\n\n我的收藏：\n' + list + '\n\n请给出最契合的序号数组。' },
+        ])
+        const m = msg && msg.match(/\[[\s\S]*?\]/)
+        if (m) {
+          try {
+            const picks = JSON.parse(m[0])
+            if (Array.isArray(picks)) {
+              const sel = picks.map((p) => items[Number(p) - 1]).filter(Boolean).slice(0, aiCount || 3)
+              if (sel.length) chosen = sel
+            }
+          } catch (e) { /* fallback */ }
+        }
       }
-      if (!cards || !cards.length) return { kind: 'error', text: 'AI 不可用或未返回结果，请检查设置里的 AI 配置（地址/模型）' }
+      const cards = chosen.map((it) => Object.assign({}, it, { reason: '' }))
       const payload = Buffer.from(JSON.stringify(cards)).toString('base64')
       await delay()
       const names = cards.map((c) => '「' + c.title + '」').join('、')
-      return { kind: 'success', text: '🤖 AI 推荐：' + names + '\nCARDS:' + payload }
+      return { kind: 'success', text: '🤖 AI 选卡：' + names + '（理由生成中…）\nCARDS:' + payload }
     }
     // AI 国外搜索选片（/playsearchw AI <描述>）
     async function aiForeignPick(desc) {
-      if (!aiEnabled) return { kind: 'error', text: 'AI 模式未启用（设置→AI 推荐需打开并配置端点）。可用普通搜索，或先配置 AI。' }
       const srcs = []
       const a = await searchAnysearch('youtube ' + desc)
       if (a) srcs.push(a)
       const wr = await tryWebList('youtube ' + desc, 2500)
       for (const r of wr) srcs.push(r)
       if (!srcs.length) return { kind: 'error', text: '没搜到国外结果（' + desc + '），换个描述试试' }
-      const list = srcs.map((it, i) => (i + 1) + '. 「' + it.title + '」 ' + (it.site === 'yt' ? 'yt:' + it.vid : it.bvid)).join('\n')
-      const sys = '你是 YouTube 视频推荐助手。用户描述需求，从候选视频里选最契合的 1-3 条。只输出 JSON 数组，格式 [{"i":条序号,"reason":"一句话理由"}]，不要输出其它内容。'
-      const msg = await aiChat([
-        { role: 'system', content: sys },
-        { role: 'user', content: '用户需求：' + desc + '\n\n候选：\n' + list + '\n\n请给出推荐。' },
-      ])
-      let cards = null
-      const m = msg && msg.match(/\[[\s\S]*?\]/)
-      if (m) {
-        try {
-          const picks = JSON.parse(m[0])
-          if (Array.isArray(picks)) {
-            cards = picks.map((p) => {
-              const it = srcs[Number(p.i) - 1]
-              return it ? Object.assign({}, it, { reason: String(p.reason || '') }) : null
-            }).filter(Boolean)
-          }
-        } catch (e) { cards = null }
+      let chosen = srcs.slice(0, aiCount || 3)
+      if (aiEnabled && srcs.length > (aiCount || 3)) {
+        const list = srcs.map((it, i) => (i + 1) + '. 「' + it.title + '」 ' + (it.site === 'yt' ? 'yt:' + it.vid : it.bvid)).join('\n')
+        const sys = '你是 YouTube 视频推荐助手。用户描述需求，从候选里选最契合的 ' + String(aiCount) + ' 条。只输出 JSON 数组，元素为候选序号（如 [2,5]），不要输出其它任何内容。'
+        const msg = await aiChat([
+          { role: 'system', content: sys },
+          { role: 'user', content: '用户需求：' + desc + '\n\n候选：\n' + list + '\n\n请给出最契合的序号数组。' },
+        ])
+        const m = msg && msg.match(/\[[\s\S]*?\]/)
+        if (m) {
+          try {
+            const picks = JSON.parse(m[0])
+            if (Array.isArray(picks)) {
+              const sel = picks.map((p) => srcs[Number(p) - 1]).filter(Boolean).slice(0, aiCount || 3)
+              if (sel.length) chosen = sel
+            }
+          } catch (e) { /* fallback */ }
+        }
       }
-      if (!cards || !cards.length) return { kind: 'error', text: 'AI 不可用或未返回结果，请检查设置里的 AI 配置（地址/模型）' }
+      const cards = chosen.map((it) => Object.assign({}, it, { reason: '' }))
       const payload = Buffer.from(JSON.stringify(cards)).toString('base64')
       await delay()
       const names = cards.map((c) => '「' + c.title + '」').join('、')
-      return { kind: 'success', text: '🤖 AI 推荐：' + names + '\nCARDS:' + payload }
+      return { kind: 'success', text: '🤖 AI 选卡：' + names + '（理由生成中…）\nCARDS:' + payload }
     }
 
     const offUrl = commands.register({
@@ -1113,6 +1144,16 @@ print(json.dumps(out))\n')
       },
     })
     ctx.effect(() => offStop)
+
+    const offHist = commands.register({
+      name: 'playhistory',
+      description: '查看播放历史（炉石卡牌，拖到中间松手播放）：/playhistory',
+      handler: async () => {
+        await delay()
+        return { kind: 'success', text: '已加载播放历史，拖牌到中间松手播放' }
+      },
+    })
+    ctx.effect(() => offHist)
 
     const offSearch = commands.register({
       name: 'playsearch',

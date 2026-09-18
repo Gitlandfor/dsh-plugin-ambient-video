@@ -19,7 +19,7 @@ window.__ModuleLoader__.load({
 					if (!raw) return {};
 					const p = JSON.parse(raw);
 					const out = {};
-					for (const k of ["draft","opacity","brightness","blur","mute","loop","proxy","localRoot","cookie","cookieSource","jfServer","jfUser","jfPass","aiEnabled","aiBase","aiModel","aiKey"]) {
+					for (const k of ["draft","opacity","brightness","blur","mute","loop","proxy","localRoot","cookie","cookieSource","jfServer","jfUser","jfPass","aiEnabled","aiBase","aiModel","aiKey","aiCount"]) {
 						if (typeof p[k] !== "undefined" && p[k] !== null) out[k] = p[k];
 					}
 					if (typeof out.opacity === "number") out.opacity = Math.min(1, Math.max(0, out.opacity));
@@ -35,7 +35,7 @@ window.__ModuleLoader__.load({
 						mute: state.mute, loop: state.loop, proxy: state.proxy,
 						localRoot: state.localRoot, cookie: state.cookie || "", cookieSource: state.cookieSource || "",
 						jfServer: state.jfServer, jfUser: state.jfUser, jfPass: state.jfPass || "",
-						aiEnabled: !!state.aiEnabled, aiBase: state.aiBase || "", aiModel: state.aiModel || "", aiKey: state.aiKey || "",
+						aiEnabled: !!state.aiEnabled, aiBase: state.aiBase || "", aiModel: state.aiModel || "", aiKey: state.aiKey || "", aiCount: Number(state.aiCount) || 3,
 					}));
 				} catch (e) { /* ignore */ }
 			}
@@ -44,7 +44,7 @@ window.__ModuleLoader__.load({
 					fetch("/ambient-config", {
 						method: "POST",
 						headers: { "Content-Type": "application/json" },
-						body: JSON.stringify({ proxy: state.proxy || "", localRoot: state.localRoot || "", cookie: state.cookie || "", cookieSource: state.cookieSource || "", aiEnabled: !!state.aiEnabled, aiBase: state.aiBase || "", aiModel: state.aiModel || "", aiKey: state.aiKey || "" }),
+						body: JSON.stringify({ proxy: state.proxy || "", localRoot: state.localRoot || "", cookie: state.cookie || "", cookieSource: state.cookieSource || "", aiEnabled: !!state.aiEnabled, aiBase: state.aiBase || "", aiModel: state.aiModel || "", aiKey: state.aiKey || "", aiCount: Number(state.aiCount) || 3 }),
 					}).catch(() => {});
 				} catch (e) { /* ignore */ }
 			}
@@ -55,7 +55,7 @@ window.__ModuleLoader__.load({
 				opacity: 0.5, brightness: 1.2, blur: 6, mute: false, loop: true,
 				proxy: "http://127.0.0.1:7897", localRoot: "", cookie: "", cookieSource: "",
 				jfServer: "", jfUser: "", jfPass: "", jfStatus: "",
-				aiEnabled: true, aiBase: "http://127.0.0.1:8000/v1", aiModel: "", aiKey: "", aiModels: [], aiStatus: "",
+				aiEnabled: true, aiBase: "http://127.0.0.1:8000/v1", aiModel: "", aiKey: "", aiCount: 3, aiModels: [], aiStatus: "",
 				duration: 0, loopInfo: "", error: "",
 				native: false, nativeLoop: false, liveFormat: "", probe: "",
 				dirPath: "", dirEntries: null, dirError: "",
@@ -69,6 +69,23 @@ window.__ModuleLoader__.load({
 
 			// ---- 循环控制（B站 VOD 已迁原生 <video>，用 loop 属性，无需声卡检测）----
 			function clearLoopAll() {}
+
+			// ---- 播放历史（localStorage，最多 20 条，新在前，同 raw 去重置顶）----
+			const HISTORY_KEY = "dsh.ambient-video.history";
+			function getHistory() {
+				try { return JSON.parse(window.localStorage.getItem(HISTORY_KEY) || "[]") } catch (e) { return [] }
+			}
+			function addHistory(rec) {
+				try {
+					let h = getHistory().filter((x) => x && x.raw !== rec.raw);
+					h.unshift(rec);
+					if (h.length > 20) h = h.slice(0, 20);
+					window.localStorage.setItem(HISTORY_KEY, JSON.stringify(h));
+				} catch (e) { /* ignore */ }
+			}
+			function clearHistory() {
+				try { window.localStorage.removeItem(HISTORY_KEY) } catch (e) {}
+			}
 
 			function fmtDuration(sec) {
 				sec = Math.floor(Number(sec) || 0);
@@ -167,9 +184,14 @@ window.__ModuleLoader__.load({
 				setState({ src: "", site: "bili", native: true, nativeLoop: true, playing: true, nonce: state.nonce + 1, duration: 0, loopInfo: "B站VOD：正在获取直链…", error: "" });
 				fetch("/ambient-playurl?bvid=" + encodeURIComponent(parsed.bvid) + "&page=" + parsed.page).then((r) => r.json()).then((r) => {
 					if (!r || !r.ok) { setState({ playing: false, error: "B站直链获取失败（" + ((r && r.error) || "") + "）：可能被风控，稍后重试" }); return; }
+					try {
+						const h = getHistory();
+						const rec = h.find((x) => x.site === "bili" && x.bvid === parsed.bvid);
+						if (rec) { rec.title = r.title || rec.title; rec.pic = r.pic || rec.pic; rec.duration = r.duration || rec.duration; window.localStorage.setItem(HISTORY_KEY, JSON.stringify(h)); }
+					} catch (e) { /* ignore */ }
 					setState({
 						src: "/ambient-proxy?url=" + encodeURIComponent(r.url),
-						native: true, nativeLoop: true, duration: r.duration || 0,
+						native: true, nativeLoop: true, duration: r.duration || 0, pic: r.pic || "",
 						loopInfo: "B站VOD（原生480P循环）：" + (r.title || parsed.bvid),
 						error: "",
 					});
@@ -188,7 +210,9 @@ window.__ModuleLoader__.load({
 				const parsed = parseVideo(raw);
 				if (!parsed) { setState({ playing: false, src: "", error: "请先输入链接/路径" }); return; }
 				clearLoopAll();
+				reasonSeq += 1; // 播放 → 取消在途的逐条理由生成
 				setState({ draft: String(raw || "").trim(), src: "", site: parsed.site, pic: "", playing: true, native: false, nativeLoop: false, liveFormat: "", nonce: state.nonce + 1, duration: 0, probe: "", error: "" });
+				addHistory({ raw: String(raw || "").trim(), site: parsed.site, bvid: parsed.bvid || "", vid: parsed.vid || "", title: "", pic: "", duration: 0, at: Date.now() });
 				if (parsed.site === "local") { playLocal(parsed.path); return; }
 				if (parsed.site === "live") { playLive(parsed.room); return; }
 				if (parsed.site === "twitch") { playTwitch(parsed.channel); return; }
@@ -371,6 +395,40 @@ window.__ModuleLoader__.load({
 			}
 
 			// 搜索结果行（普通搜索直接播 / AI 模式 CARDS 卡片）：playsearch 与 playsearchw 共用
+			// ---- 炉石风格推荐卡牌：拖拽到中间区域松手播放（点击不播放）----
+			function HsCards(cards) {
+				const [dragOver, setDragOver] = React.useState(false);
+				// 稀有度按时长：>50min 传说橙 / >30min 史诗紫 / >15min 稀有蓝 / 其余普通白
+				const rarityOf = (d) => { const x = Number(d) || 0; if (x > 3000) return "#ff8000"; if (x > 1800) return "#a335ee"; if (x > 900) return "#3d6ad6"; return "#9a9a9a"; };
+				const base = { width: 170, aspectRatio: "3/4", borderRadius: 10, background: "linear-gradient(#2a2a3a,#16161f)", cursor: "grab", position: "relative", overflow: "hidden", flex: "none", boxShadow: "0 4px 12px rgba(0,0,0,.4)" };
+				return React.createElement("div", {
+					onDragOver: (e) => { e.preventDefault(); setDragOver(true); },
+					onDragLeave: () => setDragOver(false),
+					onDrop: (e) => { e.preventDefault(); setDragOver(false); const bv = e.dataTransfer.getData("text/plain"); if (bv) play(bv); },
+					style: { display: "flex", gap: 14, padding: 10, borderRadius: 12, flexWrap: "wrap", alignItems: "flex-start",
+						border: dragOver ? "2px solid #ff4444" : "2px solid transparent",
+						boxShadow: dragOver ? "0 0 30px rgba(255,40,40,.65), inset 0 0 40px rgba(255,40,40,.25)" : "none",
+						background: dragOver ? "rgba(255,40,40,.12)" : "transparent", transition: "all .15s" },
+				}, (cards || []).map((c, i) =>
+					React.createElement("div", {
+						key: c.bvid || i,
+						draggable: true,
+						onDragStart: (e) => { e.dataTransfer.setData("text/plain", c.raw || c.bvid || ""); e.dataTransfer.effectAllowed = "copy"; },
+						onDragEnd: () => setDragOver(false),
+						style: Object.assign({}, base, { border: "3px solid " + rarityOf(c.duration) }),
+					},
+						React.createElement("img", { src: c.pic || "", alt: "", draggable: false, style: { width: "100%", height: "58%", objectFit: "cover", display: "block", pointerEvents: "none" } }),
+						(c.duration > 0 ? React.createElement("div", { style: { position: "absolute", top: 6, left: 6, background: "#1b3a8a", borderRadius: 999, padding: "2px 8px", color: "#fff", fontSize: 11, fontWeight: 600 } }, fmtDuration(c.duration)) : null),
+						React.createElement("div", { style: { padding: "4px 8px", fontSize: 12, fontWeight: 700, color: "#ffe9a8", lineHeight: 1.25, height: 34, overflow: "hidden" } }, c.title || c.raw || ""),
+						React.createElement("div", { style: { margin: "2px 8px", padding: "6px 8px", background: "#e8d5a8", borderRadius: 6, fontSize: 11, color: "#3a2f1e", lineHeight: 1.3, height: 52, overflow: "hidden" } }, c.reason ? c.reason : (c.up ? c.up + " · " : "") + "✦ AI 生成中…"),
+						React.createElement("div", { style: { position: "absolute", bottom: 4, left: 8, right: 8, fontSize: 10, color: "#8a8a9a", textAlign: "center" } }, c.up || "")
+					)
+				));
+			}
+
+			// 流式补理由序号：play() 播放时递增以取消在途的逐条生成
+			let reasonSeq = 0;
+
 			function AskResultRow(props) {
 				const node = props && props.node;
 				const [cards, setCards] = React.useState(null);
@@ -384,18 +442,65 @@ window.__ModuleLoader__.load({
 					const t = String(node.outcome.text || "");
 					const c = t.match(/CARDS:([A-Za-z0-9+/=]+)/);
 					if (c) {
-						try { setCards(JSON.parse(window.atob(c[1]))); setPhase("cards"); return; } catch (e) {}
+						try {
+							const parsed = JSON.parse(window.atob(c[1]));
+							setCards(parsed); setPhase("cards");
+							startReasons(parsed, String(node.args || "").replace(/^AI\s+/i, ""));
+							return;
+						} catch (e) {}
 					}
 					setPhase("none");
 					const b = t.match(/BV[0-9A-Za-z]{10}/);
 					if (b) play(b[0]);
 				}, [node]);
-				const header = !node ? "" : phase === "exec" ? "⏳ 执行中…" : phase === "err" ? "❌ " + (node.outcome.text || "失败") : phase === "cards" ? "🤖 点卡片播放：" : "▶ " + (node.outcome.text || "完成");
+				// 逐条异步补推荐理由（间隔 ~400ms 模拟流式；播放后 reasonSeq 变化即停止）
+				const startReasons = (list, query) => {
+					const mine = ++reasonSeq;
+					(async () => {
+						for (let i = 0; i < list.length; i++) {
+							if (reasonSeq !== mine) return;
+							const it = list[i];
+							if (!it || it.reason) continue;
+							try {
+								const r = await fetch("/ambient-ai/reason", {
+									method: "POST", headers: { "Content-Type": "application/json" },
+									body: JSON.stringify({ query: query || "", item: { title: it.title, up: it.up, duration: it.duration, bvid: it.bvid } }),
+								}).then((x) => x.json());
+								if (reasonSeq !== mine) return;
+								if (r && r.ok && r.reason) {
+									setCards((prev) => { const nx = (prev || []).slice(); nx[i] = Object.assign({}, nx[i], { reason: r.reason }); return nx; });
+								}
+							} catch (e) { /* 单条失败跳过 */ }
+							await new Promise((res) => setTimeout(res, 400));
+						}
+					})();
+				};
+				const header = !node ? "" : phase === "exec" ? "⏳ 执行中…" : phase === "err" ? "❌ " + (node.outcome.text || "失败") : phase === "cards" ? "🃏 拖牌到中间，松手播放（理由生成中…）" : "▶ " + (node.outcome.text || "完成");
 				return React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 8, padding: "4px 0" } },
 					React.createElement("div", { style: { fontSize: 12, color: "var(--dsw-alias-label-secondary)", fontFamily: "var(--ds-font-family-code, monospace)", overflowWrap: "anywhere" } },
 						"/" + (node && node.name ? node.name : "") + (node && node.args ? " " + node.args : "")),
 					React.createElement("div", { style: { fontSize: 12, color: phase === "err" ? "var(--dsw-alias-state-error-primary)" : "var(--dsw-alias-label-secondary)" } }, header),
-					cards && cards.length ? cardGrid(cards, (it) => play(it.bvid), (it) => it.pic, (it) => fmtDuration(it.duration) + (it.reason ? " · " + it.reason : "")) : null
+					cards && cards.length ? HsCards(cards) : null
+				);
+			}
+
+			// 播放历史行：读 localStorage 历史 → 炉石卡牌 → 拖拽播放（点击无效）
+			function PlayHistoryRow(props) {
+				const node = props && props.node;
+				const [cards, setCards] = React.useState(null);
+				const fired = React.useRef(false);
+				React.useEffect(() => {
+					if (!node || fired.current) return;
+					if (node.outcome === null) return;
+					fired.current = true;
+					if (node.outcome.kind !== "success") return;
+					setCards(getHistory());
+				}, [node]);
+				const header = !node ? "" : node.outcome === null ? "⏳ 读取历史…" : "🃏 拖牌到中间，松手播放（点击无效）：";
+				return React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 8, padding: "4px 0" } },
+					React.createElement("div", { style: { fontSize: 12, color: "var(--dsw-alias-label-secondary)", fontFamily: "var(--ds-font-family-code, monospace)", overflowWrap: "anywhere" } }, "/playhistory"),
+					React.createElement("div", { style: { fontSize: 12, color: "var(--dsw-alias-label-secondary)" } }, header),
+					cards && cards.length ? HsCards(cards) : (node && node.outcome && node.outcome.kind === "success" ? React.createElement("div", { style: { fontSize: 12, color: "var(--dsw-alias-label-secondary)" } }, "暂无播放历史，先播放几个视频吧") : null)
 				);
 			}
 
@@ -635,6 +740,10 @@ window.__ModuleLoader__.load({
 							style: Object.assign({}, inputBase, { flex: 1, height: 30, padding: "0 10px", fontSize: 12 }),
 						}),
 					),
+					React.createElement("div", { style: row },
+						React.createElement("span", { style: labelStyle }, "推荐数量"),
+						[1, 2, 3, 4, 5].map((n) => React.createElement("label", { key: n, style: { display: "flex", alignItems: "center", gap: 3, fontSize: 12 } },
+							React.createElement("input", { type: "radio", name: "aiCount", checked: (Number(s.aiCount) || 3) === n, onChange: () => { setState({ aiCount: n }); syncConfig(); } }), n + "张"))),
 					s.aiStatus ? React.createElement("div", { style: subStyle }, s.aiStatus) : null,
 					React.createElement("div", { style: subStyle }, "/playsearch AI <描述>：从B站收藏 AI 选片出卡片；/playsearchw AI <描述>：国外结果 AI 选片。AI 未配置/失败会明确报错。"),
 
@@ -786,6 +895,10 @@ window.__ModuleLoader__.load({
 			slots.inject("conversation.chat.commandview", () => slots.register(
 				{ name: "conversation.chat.commandview", key: "playstop" },
 				(props) => React.createElement(PlayStopRow, { node: props && props.node })
+			));
+			slots.inject("conversation.chat.commandview", () => slots.register(
+				{ name: "conversation.chat.commandview", key: "playhistory" },
+				(props) => React.createElement(PlayHistoryRow, { node: props && props.node })
 			));
 			slots.inject("conversation.chat.commandview", () => slots.register(
 				{ name: "conversation.chat.commandview", key: "playsearch" },
