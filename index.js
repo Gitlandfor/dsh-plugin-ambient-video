@@ -87,11 +87,18 @@ function apply(ctx) {
   let aiKey = ''
   let aiEnabled = true
   let aiCount = 3
+  // 说明(补理由) AI 独立配置：留空 = 跟随选卡 AI
+  let reasonBase = ''
+  let reasonModel = ''
+  let reasonKey = ''
+  let reasonEnabled = true
 
-  async function aiModels() {
-    if (!shell || !aiBase) return []
-    const h = aiKey ? ' -H ' + JSON.stringify('Authorization: Bearer ' + aiKey) : ''
-    const cmd = 'curl -s --max-time 6' + h + ' ' + JSON.stringify(aiBase.replace(/\/+$/, '') + '/models')
+  async function aiModels(cfg) {
+    const base = (cfg && cfg.base) || aiBase
+    const key = (cfg && cfg.key) || aiKey
+    if (!shell || !base) return []
+    const h = key ? ' -H ' + JSON.stringify('Authorization: Bearer ' + key) : ''
+    const cmd = 'curl -s --max-time 6' + h + ' ' + JSON.stringify(base.replace(/\/+$/, '') + '/models')
     const spec = shell.resolve({ command: cmd, timeoutMs: 10000, stdoutMaxBytes: 524288 })
     const r = await shell.run(spec)
     try {
@@ -100,13 +107,16 @@ function apply(ctx) {
     } catch (e) { return [] }
   }
 
-  async function aiChat(userContent, maxTokens) {
-    if (!shell || !aiBase) return null
-    const body = { model: aiModel || 'local-model', messages: userContent, temperature: 0.3, max_tokens: maxTokens || 1024 }
+  async function aiChat(userContent, maxTokens, cfg) {
+    const base = (cfg && cfg.base) || aiBase
+    const model = (cfg && cfg.model) || aiModel
+    const key = (cfg && cfg.key) || aiKey
+    if (!shell || !base) return null
+    const body = { model: model || 'local-model', messages: userContent, temperature: 0.3, max_tokens: maxTokens || 1024 }
     const tmp = path.join(os.tmpdir(), 'dsh-ai-' + Date.now() + '-' + crypto.randomBytes(4).toString('hex') + '.json')
     fs.writeFileSync(tmp, JSON.stringify(body))
-    const h = aiKey ? ' -H ' + JSON.stringify('Authorization: Bearer ' + aiKey) : ''
-    const cmd = 'curl -s --max-time 40 -X POST -H ' + JSON.stringify('Content-Type: application/json') + h + ' -d @' + JSON.stringify(tmp) + ' ' + JSON.stringify(aiBase.replace(/\/+$/, '') + '/chat/completions')
+    const h = key ? ' -H ' + JSON.stringify('Authorization: Bearer ' + key) : ''
+    const cmd = 'curl -s --max-time 40 -X POST -H ' + JSON.stringify('Content-Type: application/json') + h + ' -d @' + JSON.stringify(tmp) + ' ' + JSON.stringify(base.replace(/\/+$/, '') + '/chat/completions')
     try { fs.unlinkSync(tmp) } catch (e) {}
     const spec = shell.resolve({ command: cmd, timeoutMs: 45000, stdoutMaxBytes: 1048576 })
     const r = await shell.run(spec)
@@ -272,7 +282,11 @@ function apply(ctx) {
             if (typeof p.aiKey === 'string') aiKey = p.aiKey.trim()
             const ac = Number(p.aiCount) || 3
             if (ac >= 1 && ac <= 5) aiCount = ac
-            json(res, { ok: true, proxy: searchProxy, localRoot, cookieSet: !!biliCookieStr, cookieSource, aiEnabled, aiBase, aiModel, aiSet: !!aiModel })
+            if (typeof p.reasonEnabled === 'boolean') reasonEnabled = p.reasonEnabled
+            if (typeof p.reasonBase === 'string') reasonBase = p.reasonBase.trim().replace(/\/+$/, '')
+            if (typeof p.reasonModel === 'string') reasonModel = p.reasonModel.trim()
+            if (typeof p.reasonKey === 'string') reasonKey = p.reasonKey.trim()
+            json(res, { ok: true, proxy: searchProxy, localRoot, cookieSet: !!biliCookieStr, cookieSource, aiEnabled, aiBase, aiModel, aiSet: !!aiModel, reasonEnabled, reasonBase, reasonModel })
           } catch (e) {
             json(res, { ok: false }, 500)
           }
@@ -786,7 +800,11 @@ function apply(ctx) {
       kind: 'exact',
       path: '/ambient-ai/test',
       handler: async (req, res) => {
-        const models = await aiModels()
+        const u = new URL(req.url || '/', 'http://internal')
+        const kind = String(u.searchParams.get('kind') || '')
+        const models = kind === 'reason'
+          ? await aiModels({ base: reasonBase || aiBase, key: reasonKey || aiKey })
+          : await aiModels()
         json(res, { ok: models.length > 0, models })
       },
     })
@@ -807,12 +825,12 @@ function apply(ctx) {
             const title = String(it.title || '')
             const up = String(it.up || '')
             const dur = Number(it.duration || 0)
-            if (!aiEnabled) { json(res, { ok: false, error: 'ai-disabled' }); return }
+            if (!reasonEnabled) { json(res, { ok: false, error: 'reason-disabled' }); return }
             const sys = '你是视频推荐助手，为每条视频写一句 15-25 字的推荐理由，说明它为什么适合作为工作/学习的氛围背景视频。只输出理由本身，不要引号、不要前缀。'
             const msg = await aiChat([
               { role: 'system', content: sys },
               { role: 'user', content: '用户需求：' + query + '\n视频：' + (title || '未知') + '（UP:' + (up || '未知') + '，时长' + Math.round(dur / 60) + '分钟）\n请写推荐理由。' },
-            ], 256)
+            ], 256, { base: reasonBase || aiBase, model: reasonModel || aiModel, key: reasonKey || aiKey })
             const reason = msg ? String(msg).trim().replace(/^["'“”\s]+|["'“”\s]+$/g, '').slice(0, 120) : ''
             json(res, { ok: !!reason, reason })
           } catch (e) { json(res, { ok: false, error: 'fail' }) }

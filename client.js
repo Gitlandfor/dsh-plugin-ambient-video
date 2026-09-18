@@ -19,7 +19,7 @@ window.__ModuleLoader__.load({
 					if (!raw) return {};
 					const p = JSON.parse(raw);
 					const out = {};
-					for (const k of ["draft","opacity","brightness","blur","mute","loop","proxy","localRoot","cookie","cookieSource","jfServer","jfUser","jfPass","aiEnabled","aiBase","aiModel","aiKey","aiCount"]) {
+					for (const k of ["draft","opacity","brightness","blur","mute","loop","proxy","localRoot","cookie","cookieSource","jfServer","jfUser","jfPass","aiEnabled","aiBase","aiModel","aiKey","aiCount","reasonEnabled","reasonBase","reasonModel","reasonKey"]) {
 						if (typeof p[k] !== "undefined" && p[k] !== null) out[k] = p[k];
 					}
 					if (typeof out.opacity === "number") out.opacity = Math.min(1, Math.max(0, out.opacity));
@@ -36,6 +36,7 @@ window.__ModuleLoader__.load({
 						localRoot: state.localRoot, cookie: state.cookie || "", cookieSource: state.cookieSource || "",
 						jfServer: state.jfServer, jfUser: state.jfUser, jfPass: state.jfPass || "",
 						aiEnabled: !!state.aiEnabled, aiBase: state.aiBase || "", aiModel: state.aiModel || "", aiKey: state.aiKey || "", aiCount: Number(state.aiCount) || 3,
+						reasonEnabled: !!state.reasonEnabled, reasonBase: state.reasonBase || "", reasonModel: state.reasonModel || "", reasonKey: state.reasonKey || "",
 					}));
 				} catch (e) { /* ignore */ }
 			}
@@ -44,7 +45,7 @@ window.__ModuleLoader__.load({
 					fetch("/ambient-config", {
 						method: "POST",
 						headers: { "Content-Type": "application/json" },
-						body: JSON.stringify({ proxy: state.proxy || "", localRoot: state.localRoot || "", cookie: state.cookie || "", cookieSource: state.cookieSource || "", aiEnabled: !!state.aiEnabled, aiBase: state.aiBase || "", aiModel: state.aiModel || "", aiKey: state.aiKey || "", aiCount: Number(state.aiCount) || 3 }),
+						body: JSON.stringify({ proxy: state.proxy || "", localRoot: state.localRoot || "", cookie: state.cookie || "", cookieSource: state.cookieSource || "", aiEnabled: !!state.aiEnabled, aiBase: state.aiBase || "", aiModel: state.aiModel || "", aiKey: state.aiKey || "", aiCount: Number(state.aiCount) || 3, reasonEnabled: !!state.reasonEnabled, reasonBase: state.reasonBase || "", reasonModel: state.reasonModel || "", reasonKey: state.reasonKey || "" }),
 					}).catch(() => {});
 				} catch (e) { /* ignore */ }
 			}
@@ -56,6 +57,7 @@ window.__ModuleLoader__.load({
 				proxy: "http://127.0.0.1:7897", localRoot: "", cookie: "", cookieSource: "",
 				jfServer: "", jfUser: "", jfPass: "", jfStatus: "",
 				aiEnabled: true, aiBase: "http://127.0.0.1:8000/v1", aiModel: "", aiKey: "", aiCount: 3, aiModels: [], aiStatus: "",
+				reasonEnabled: true, reasonBase: "", reasonModel: "", reasonKey: "", reasonModels: [], reasonStatus: "",
 				duration: 0, loopInfo: "", error: "",
 				native: false, nativeLoop: false, liveFormat: "", probe: "",
 				dirPath: "", dirEntries: null, dirError: "",
@@ -685,17 +687,18 @@ window.__ModuleLoader__.load({
 					) : null,
 					React.createElement("div", { style: subStyle }, "点卡片在本插件里原生循环播放（HLS 串流，服务端自动适配转码，HEVC/4K 也能解）。"),
 
-					// ---- AI 推荐 ----
-					React.createElement("div", { style: sectionTitle }, "🤖 AI 推荐（/playsearch AI 入口）"),
+					// ---- AI 推荐（选卡 AI 与补理由 AI 分开配置）----
+					React.createElement("div", { style: sectionTitle }, "🤖 AI 推荐"),
+					React.createElement("div", { style: { fontSize: 13, fontWeight: 600, color: "var(--dsh-alias-label-primary)", marginTop: 6 } }, "🎯 选卡 AI（/playsearch AI 选片）"),
 					React.createElement("label", { style: row },
 						React.createElement("input", {
 							type: "checkbox", checked: !!s.aiEnabled,
 							onChange: (e) => setState({ aiEnabled: e.target.checked }),
 						}),
-						React.createElement("span", { style: labelStyle }, "启用 AI 推荐（关闭则 AI 模式明确报错）")
+						React.createElement("span", { style: labelStyle }, "启用（关闭则 AI 模式明确报错）")
 					),
 					React.createElement("div", { style: row },
-						React.createElement("span", { style: labelStyle }, "AI 地址"),
+						React.createElement("span", { style: labelStyle }, "地址"),
 						React.createElement("input", {
 							value: s.aiBase,
 							onChange: (e) => setState({ aiBase: e.target.value }),
@@ -708,18 +711,18 @@ window.__ModuleLoader__.load({
 						React.createElement("input", {
 							value: s.aiModel,
 							onChange: (e) => setState({ aiModel: e.target.value }),
-							placeholder: "如 Qwen3.5-4B-AWQ：/playsearch AI 用它选片", spellCheck: false,
+							placeholder: "如 Qwen3.5-4B-AWQ", spellCheck: false,
 							style: Object.assign({}, inputBase, { flex: 1, height: 30, padding: "0 10px", fontSize: 12 }),
 						}),
 						React.createElement("button", {
 							onClick: () => {
 								fetch("/ambient-ai/test").then((r) => r.json()).then((r) => {
-									if (r && r.ok && r.models.length) { setState({ aiModels: r.models, aiModel: s.aiModel || r.models[0], aiStatus: "已连上 " + r.models.length + " 个模型" }); syncConfig(); }
-									else setState({ aiStatus: "连不上 AI，检查地址/密钥" });
+									if (r && r.ok && r.models.length) { setState({ aiModels: r.models, aiModel: s.aiModel || r.models[0], aiStatus: "选卡AI已连上 " + r.models.length + " 个模型" }); syncConfig(); }
+									else setState({ aiStatus: "选卡AI连不上，检查地址/密钥" });
 								}).catch(() => setState({ aiStatus: "接口异常" }));
 							},
 							style: Object.assign({}, iconBtn, { height: 30, fontSize: 12, padding: "0 10px", borderRadius: 8, border: "0.5px solid var(--dsw-alias-border-l3)", background: "var(--dsw-alias-button-elevated-fill)" }),
-						}, "🔌 测试/获取模型"),
+						}, "🔌 测试"),
 					),
 					s.aiModels.length ? React.createElement("div", { style: row },
 						React.createElement("select", {
@@ -745,7 +748,63 @@ window.__ModuleLoader__.load({
 						[1, 2, 3, 4, 5].map((n) => React.createElement("label", { key: n, style: { display: "flex", alignItems: "center", gap: 3, fontSize: 12 } },
 							React.createElement("input", { type: "radio", name: "aiCount", checked: (Number(s.aiCount) || 3) === n, onChange: () => { setState({ aiCount: n }); syncConfig(); } }), n + "张"))),
 					s.aiStatus ? React.createElement("div", { style: subStyle }, s.aiStatus) : null,
-					React.createElement("div", { style: subStyle }, "/playsearch AI <描述>：从B站收藏 AI 选片出卡片；/playsearchw AI <描述>：国外结果 AI 选片。AI 未配置/失败会明确报错。"),
+
+					React.createElement("div", { style: { fontSize: 13, fontWeight: 600, color: "var(--dsh-alias-label-primary)", marginTop: 14 } }, "✍️ 补理由 AI（卡片推荐理由，留空=跟随选卡 AI）"),
+					React.createElement("label", { style: row },
+						React.createElement("input", {
+							type: "checkbox", checked: !!s.reasonEnabled,
+							onChange: (e) => setState({ reasonEnabled: e.target.checked }),
+						}),
+						React.createElement("span", { style: labelStyle }, "启用（关闭则卡片不生成理由）")
+					),
+					React.createElement("div", { style: row },
+						React.createElement("span", { style: labelStyle }, "地址"),
+						React.createElement("input", {
+							value: s.reasonBase,
+							onChange: (e) => setState({ reasonBase: e.target.value }),
+							placeholder: "留空=用选卡 AI 的地址", spellCheck: false,
+							style: Object.assign({}, inputBase, { flex: 1, height: 30, padding: "0 10px", fontSize: 12 }),
+						}),
+					),
+					React.createElement("div", { style: row },
+						React.createElement("span", { style: labelStyle }, "模型"),
+						React.createElement("input", {
+							value: s.reasonModel,
+							onChange: (e) => setState({ reasonModel: e.target.value }),
+							placeholder: "留空=用选卡 AI 的模型", spellCheck: false,
+							style: Object.assign({}, inputBase, { flex: 1, height: 30, padding: "0 10px", fontSize: 12 }),
+						}),
+						React.createElement("button", {
+							onClick: () => {
+								fetch("/ambient-ai/test?kind=reason").then((r) => r.json()).then((r) => {
+									if (r && r.ok && r.models.length) { setState({ reasonModels: r.models, reasonModel: s.reasonModel || r.models[0], reasonStatus: "补理由AI已连上 " + r.models.length + " 个模型" }); syncConfig(); }
+									else setState({ reasonStatus: "补理由AI连不上（或留空跟随选卡）" });
+								}).catch(() => setState({ reasonStatus: "接口异常" }));
+							},
+							style: Object.assign({}, iconBtn, { height: 30, fontSize: 12, padding: "0 10px", borderRadius: 8, border: "0.5px solid var(--dsw-alias-border-l3)", background: "var(--dsw-alias-button-elevated-fill)" }),
+						}, "🔌 测试"),
+					),
+					s.reasonModels.length ? React.createElement("div", { style: row },
+						React.createElement("select", {
+							value: s.reasonModel,
+							onChange: (e) => { setState({ reasonModel: e.target.value }); syncConfig(); },
+							style: Object.assign({}, inputBase, { height: 28, flex: 1, padding: "0 8px", fontSize: 12 }),
+						},
+							React.createElement("option", { value: "" }, "选择模型…"),
+							s.reasonModels.map((m) => React.createElement("option", { key: m, value: m }, m))
+						)
+					) : null,
+					React.createElement("div", { style: row },
+						React.createElement("span", { style: labelStyle }, "API Key"),
+						React.createElement("input", {
+							value: s.reasonKey,
+							onChange: (e) => { setState({ reasonKey: e.target.value }); syncConfig(); },
+							placeholder: "留空=用选卡 AI 的 Key", type: "password", spellCheck: false,
+							style: Object.assign({}, inputBase, { flex: 1, height: 30, padding: "0 10px", fontSize: 12 }),
+						}),
+					),
+					s.reasonStatus ? React.createElement("div", { style: subStyle }, s.reasonStatus) : null,
+					React.createElement("div", { style: subStyle }, "/playsearch AI <描述> 选卡（🎯）；卡片理由逐条生成（✍️）。两套 AI 可分别配置：选卡用快的，理由用好的。"),
 
 					// ---- B站收藏 ----
 					React.createElement("div", { style: sectionTitle }, "⭐ B站收藏推荐"),
