@@ -99,6 +99,46 @@ function apply(ctx) {
   let askSeq = 0
   let askLast = null
 
+  // 配置持久化：cookie 等此前只活在内存里，进程一重启就清空，
+  // 客户端要等页面重载才回推 → 表现为"cookie 莫名其妙过期"（实测调试重启后 cookieSet 全变 false）。
+  // 落盘后重启自愈，不依赖浏览器。
+  const stateFile = path.join(os.homedir(), '.dsh', 'ambient-video-state.json')
+  function loadState() {
+    try { const d = JSON.parse(fs.readFileSync(stateFile, 'utf8') || '{}'); return d && typeof d === 'object' ? d : {} } catch (e) { return {} }
+  }
+  function saveState(patch) {
+    try {
+      const cur = loadState()
+      for (const k of Object.keys(patch)) {
+        const v = patch[k]
+        // 客户端推空串时不清掉已存的 cookie（防止一次刷新误擦）
+        if (k === 'cookie' && !(typeof v === 'string' && v.trim())) continue
+        if (v !== undefined && v !== null) cur[k] = v
+      }
+      fs.writeFileSync(stateFile, JSON.stringify(cur), { mode: 0o600 })
+    } catch (e) { /* 持久化失败不影响主流程，但别完全静默 */ try { console.error('[ambient-video] saveState:', String(e && e.message || e)) } catch (e2) {} }
+  }
+  const st0 = loadState()
+  if (typeof st0.cookie === 'string' && st0.cookie.trim()) { biliCookieStr = st0.cookie; cookieSource = typeof st0.cookieSource === 'string' ? st0.cookieSource : 'paste' }
+  if (typeof st0.aiEnabled === 'boolean') aiEnabled = st0.aiEnabled
+  if (typeof st0.aiProvider === 'string' && st0.aiProvider.trim()) aiProvider = st0.aiProvider.trim()
+  if (typeof st0.aiBase === 'string' && st0.aiBase.trim()) aiBase = st0.aiBase.trim().replace(/\/+$/, '')
+  if (typeof st0.aiModel === 'string') aiModel = st0.aiModel
+  if (typeof st0.aiKey === 'string') aiKey = st0.aiKey
+  const ac0 = Number(st0.aiCount) || 0
+  if (ac0 >= 1 && ac0 <= 5) aiCount = ac0
+  if (typeof st0.reasonEnabled === 'boolean') reasonEnabled = st0.reasonEnabled
+  if (typeof st0.reasonProvider === 'string') reasonProvider = st0.reasonProvider
+  if (typeof st0.reasonBase === 'string' && st0.reasonBase.trim()) reasonBase = st0.reasonBase.trim().replace(/\/+$/, '')
+  if (typeof st0.reasonModel === 'string') reasonModel = st0.reasonModel
+  if (typeof st0.reasonKey === 'string') reasonKey = st0.reasonKey
+  if (typeof st0.proxy === 'string' && st0.proxy.trim()) searchProxy = st0.proxy.trim()
+  if (typeof st0.localRoot === 'string' && st0.localRoot.trim()) {
+    const rt0 = expandHome(st0.localRoot)
+    const real0 = realpathSafe(rt0)
+    if (real0 && fs.existsSync(real0) && fs.statSync(real0).isDirectory()) localRoot = real0
+  }
+
   // provider 已配但模型名留空时，自动取该 provider 的第一个模型
   async function resolveModel(provider, wanted) {
     if (wanted) return wanted
@@ -337,6 +377,7 @@ function apply(ctx) {
             if (typeof p.reasonBase === 'string') reasonBase = p.reasonBase.trim().replace(/\/+$/, '')
             if (typeof p.reasonModel === 'string') reasonModel = p.reasonModel.trim()
             if (typeof p.reasonKey === 'string') reasonKey = p.reasonKey.trim()
+            saveState({ cookie: biliCookieStr, cookieSource, aiEnabled, aiProvider, aiBase, aiModel, aiKey, aiCount, reasonEnabled, reasonProvider, reasonBase, reasonModel, reasonKey, proxy: searchProxy, localRoot })
             json(res, { ok: true, proxy: searchProxy, localRoot, cookieSet: !!biliCookieStr, cookieSource, aiEnabled, aiProvider, aiBase, aiModel, aiSet: !!aiModel, reasonEnabled, reasonProvider, reasonBase, reasonModel })
           } catch (e) {
             json(res, { ok: false }, 500)
