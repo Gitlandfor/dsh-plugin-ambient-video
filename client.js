@@ -507,7 +507,15 @@ window.__ModuleLoader__.load({
 				let cards = null;
 				if (text) {
 					const m = text.match(/CARDS:([A-Za-z0-9+/=]+)/);
-					if (m) { try { cards = JSON.parse(window.atob(m[1])); } catch (e) {} }
+					if (m) {
+						// atob 返回 Latin-1 二进制串，不是 UTF-8：直接 JSON.parse 会把 UTF-8 字节
+						// 拆成拉丁字符（日 -> æ¥）导致卡面标题乱码。必须经 Uint8Array + TextDecoder 还原。
+						// 只有走 base64 CARDS 载荷的搜索卡会中招，历史卡走 localStorage 原生 JSON 所以正常。
+						try {
+							const bytes = Uint8Array.from(window.atob(m[1]), (c) => c.charCodeAt(0));
+							cards = JSON.parse(new TextDecoder("utf-8").decode(bytes));
+						} catch (e) { try { cards = JSON.parse(window.atob(m[1])); } catch (e2) {} }
+					}
 				}
 				const argText = node && node.args ? (Array.isArray(node.args) ? node.args.join(" ") : String(node.args)) : "";
 				const queryText = argText.replace(/^AI\s+/i, "").trim();
