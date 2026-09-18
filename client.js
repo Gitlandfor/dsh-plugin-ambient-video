@@ -210,6 +210,7 @@ window.__ModuleLoader__.load({
 			}
 
 			function play(raw) {
+				clearOverlay();
 				const parsed = parseVideo(raw);
 				if (!parsed) { setState({ playing: false, src: "", error: "请先输入链接/路径" }); return; }
 				clearLoopAll();
@@ -398,92 +399,170 @@ window.__ModuleLoader__.load({
 			}
 
 			// 搜索结果行（普通搜索直接播 / AI 模式 CARDS 卡片）：playsearch 与 playsearchw 共用
-			// ---- 炉石风格推荐卡牌：拖拽到中间区域松手播放（点击不播放）----
-			function HsCards(cards) {
-				const [dragOver, setDragOver] = React.useState(false);
-				// 稀有度按时长：>50min 传说橙 / >30min 史诗紫 / >15min 稀有蓝 / 其余普通白
-				const rarityOf = (d) => { const x = Number(d) || 0; if (x > 3000) return "#ff8000"; if (x > 1800) return "#a335ee"; if (x > 900) return "#3d6ad6"; return "#9a9a9a"; };
-				const base = { width: 170, aspectRatio: "3/4", borderRadius: 10, background: "linear-gradient(#2a2a3a,#16161f)", cursor: "grab", position: "relative", overflow: "hidden", flex: "none", boxShadow: "0 4px 12px rgba(0,0,0,.4)" };
-				return React.createElement("div", {
-					onDragOver: (e) => { e.preventDefault(); setDragOver(true); },
-					onDragLeave: () => setDragOver(false),
-					onDrop: (e) => { e.preventDefault(); setDragOver(false); const bv = e.dataTransfer.getData("text/plain"); if (bv) play(bv); },
-					style: { display: "flex", gap: 14, padding: 10, borderRadius: 12, flexWrap: "wrap", alignItems: "flex-start",
-						border: dragOver ? "2px solid #ff4444" : "2px solid transparent",
-						boxShadow: dragOver ? "0 0 30px rgba(255,40,40,.65), inset 0 0 40px rgba(255,40,40,.25)" : "none",
-						background: dragOver ? "rgba(255,40,40,.12)" : "transparent", transition: "all .15s" },
-				}, (cards || []).map((c, i) =>
-					React.createElement("div", {
-						key: c.bvid || i,
-						draggable: true,
-						onDragStart: (e) => { e.dataTransfer.setData("text/plain", c.raw || c.bvid || ""); e.dataTransfer.effectAllowed = "copy"; },
-						onDragEnd: () => setDragOver(false),
-						style: Object.assign({}, base, { border: "3px solid " + rarityOf(c.duration) }),
-					},
-						React.createElement("img", { src: c.pic || "", alt: "", draggable: false, style: { width: "100%", height: "58%", objectFit: "cover", display: "block", pointerEvents: "none" } }),
-						(c.duration > 0 ? React.createElement("div", { style: { position: "absolute", top: 6, left: 6, background: "#1b3a8a", borderRadius: 999, padding: "2px 8px", color: "#fff", fontSize: 11, fontWeight: 600 } }, fmtDuration(c.duration)) : null),
-						React.createElement("div", { style: { padding: "4px 8px", fontSize: 12, fontWeight: 700, color: "#ffe9a8", lineHeight: 1.25, height: 34, overflow: "hidden" } }, c.title || c.raw || ""),
-						React.createElement("div", { style: { margin: "2px 8px", padding: "6px 8px", background: "#e8d5a8", borderRadius: 6, fontSize: 11, color: "#3a2f1e", lineHeight: 1.3, height: 52, overflow: "hidden" } }, c.reason ? c.reason : (c.up ? c.up + " · " : "") + "✦ AI 生成中…"),
-						React.createElement("div", { style: { position: "absolute", bottom: 4, left: 8, right: 8, fontSize: 10, color: "#8a8a9a", textAlign: "center" } }, c.up || "")
-					)
-				));
+			// ---- 顶层卡片浮层：/playsearch AI、/playhistory 的卡牌弹层 ----
+			// 聊天行只留一句摘要，卡牌统一弹到 shell.overlay 顶层（覆盖屏幕最上层）
+			// 状态挂 window：模块工厂可能因 combo / 单资源两种 URL 各执行一次，
+			// 挂 window 才能跨实例共享，否则浮层永远收不到聊天行的通知
+			const OV = window.__dshAmbientOverlay || (window.__dshAmbientOverlay = { cards: null, source: "", seq: 0, listeners: new Set() });
+			function setOverlayCards(cards, source) {
+				OV.cards = cards; OV.source = source || ""; OV.seq += 1;
+				OV.listeners.forEach((fn) => { try { fn(OV.cards, OV.source, OV.seq); } catch (e) {} });
 			}
+			function clearOverlay() { setOverlayCards(null, ""); }
+			function onOverlayCards(fn) {
+				OV.listeners.add(fn);
+				return () => OV.listeners.delete(fn);
+			}
+			// 单张炉石风卡牌（按时长定稀有度：>50min 传说橙 / >30min 史诗紫 / >15min 稀有蓝 / 其余普通白）
+			// 只能拖拽，点击无效
+			function HsCardEl(c, i) {
+				const x = Number(c.duration) || 0;
+				const rarity = x > 3000 ? "#ff8000" : x > 1800 ? "#a335ee" : x > 900 ? "#3d6ad6" : "#9a9a9a";
+				return React.createElement("div", {
+					key: c.bvid || i,
+					draggable: true,
+					onDragStart: (e) => { e.dataTransfer.setData("text/plain", c.raw || c.bvid || ""); e.dataTransfer.effectAllowed = "copy"; },
+					style: { width: 172, height: 229, borderRadius: 10, background: "linear-gradient(#2a2a3a,#16161f)", cursor: "grab", position: "relative", overflow: "hidden", flex: "none", boxSizing: "border-box", boxShadow: "0 6px 18px rgba(0,0,0,.55)", border: "3px solid " + rarity },
+				},
+					c.pic ? React.createElement("img", { src: c.pic, alt: "", draggable: false, referrerPolicy: "no-referrer", onError: (e) => { e.currentTarget.style.display = "none"; }, style: { width: "100%", height: 128, objectFit: "cover", display: "block", pointerEvents: "none" } }) : React.createElement("div", { style: { height: 128, display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center", padding: 10, boxSizing: "border-box", fontSize: 11, color: "#8a8a9a", lineHeight: 1.3 } }, "无封面"),
+					x > 0 ? React.createElement("div", { style: { position: "absolute", top: 6, left: 6, background: "#1b3a8a", borderRadius: 999, padding: "2px 8px", color: "#fff", fontSize: 11, fontWeight: 600 } }, fmtDuration(x)) : null,
+					React.createElement("div", { style: { padding: "4px 8px", fontSize: 12, fontWeight: 700, color: "#ffe9a8", lineHeight: 1.25, height: 36, overflow: "hidden" } }, c.title || c.raw || ""),
+					React.createElement("div", { style: { margin: "2px 8px", padding: "6px 8px", background: "#e8d5a8", borderRadius: 6, fontSize: 11, color: "#3a2f1e", lineHeight: 1.3, height: 54, overflow: "hidden" } }, c.reason ? c.reason : (c.up ? c.up + " · " : "") + "✦ AI 生成中…"),
+					React.createElement("div", { style: { position: "absolute", bottom: 4, left: 8, right: 8, fontSize: 10, color: "#8a8a9a", textAlign: "center" } }, c.up || "")
+				);
+			}
+			// 浮层本体：中间投放区（拖入红光）+ 底部手牌；Esc / 点空白 / ✕ 关闭
+			function CardOverlay() {
+				const [cards, setCards] = React.useState(OV.cards);
+				const [source, setSource] = React.useState(OV.source);
+				const [dragOver, setDragOver] = React.useState(false);
+				const unsub = React.useRef(null);
+				const seenSeq = React.useRef(OV.seq);
+				React.useEffect(() => {
+					unsub.current = onOverlayCards((c, s, sq) => { seenSeq.current = sq; setCards(c); setSource(s || ""); });
+					// 兜底通道：host 记录最近一次 AI 选卡结果，客户端轮询。只对本次会话内的 seq 变化响应，
+					// 所以刷新页面不会弹出上次的旧卡片
+					let alive = true, first = true;
+					const tick = async () => {
+						try {
+							const r = await fetch("/ambient-ask/state").then((x) => x.json());
+							if (!r || !r.ok) return;
+							if (first) { first = false; seenSeq.current = r.seq || 0; return; }
+							if (r.seq > seenSeq.current && r.cards && r.cards.length) {
+								seenSeq.current = r.seq;
+								setCards(r.cards);
+								setSource("\U0001F0CF " + (r.query || "AI 推荐"));
+							}
+						} catch (e) {}
+					};
+					const id = setInterval(tick, 1500);
+					tick();
+					return () => { alive = false; clearInterval(id); if (unsub.current) unsub.current(); };
+				}, []);
+				React.useEffect(() => {
+					if (!cards || !cards.length) return undefined;
+					const onKey = (e) => { if (e.key === "Escape") clearOverlay(); };
+					document.addEventListener("keydown", onKey);
+					return () => document.removeEventListener("keydown", onKey);
+				}, [cards]);
+				if (!cards || !cards.length) return null;
+				return React.createElement("div", {
+					onClick: () => clearOverlay(),
+					style: { position: "fixed", inset: 0, zIndex: 99999, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "rgba(6,6,12,.84)", backdropFilter: "blur(4px)", WebkitBackdropFilter: "blur(4px)" },
+				},
+					React.createElement("div", { style: { position: "absolute", top: 16, right: 18, display: "flex", gap: 10, alignItems: "center", pointerEvents: "none", padding: "6px 12px", borderRadius: 8, background: "rgba(0,0,0,.4)", border: "1px solid rgba(255,255,255,.12)" } },
+						React.createElement("span", { style: { fontSize: 13, color: "#e6e8f5", fontWeight: 600 } }, source),
+						React.createElement("span", { style: { fontSize: 13, color: "#cfd2e6" } }, "共 " + cards.length + " 张"),
+						React.createElement("span", { style: { fontSize: 11, color: "#8a8a9a" } }, "Esc / 点空白关闭")
+					),
+					React.createElement("button", {
+						onClick: (e) => { e.stopPropagation(); clearOverlay(); },
+						style: { position: "absolute", top: 14, left: 14, width: 32, height: 32, borderRadius: 8, fontSize: 15, lineHeight: "1", cursor: "pointer", background: "rgba(255,255,255,.12)", border: "1px solid rgba(255,255,255,.25)", color: "#fff" }
+					}, "✕"),
+					React.createElement("div", {
+						onDragOver: (e) => { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; setDragOver(true); },
+						onDragLeave: () => setDragOver(false),
+						onDrop: (e) => { e.preventDefault(); setDragOver(false); const v = e.dataTransfer.getData("text/plain"); if (v) { clearOverlay(); play(v); } },
+						style: { width: "min(720px, 60vw)", height: "38vh", borderRadius: 18, display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center", padding: 20, boxSizing: "border-box", border: dragOver ? "3px solid #ff4444" : "2px dashed rgba(255,255,255,.3)", background: dragOver ? "rgba(255,40,40,.16)" : "rgba(255,255,255,.05)", boxShadow: dragOver ? "0 0 70px rgba(255,40,40,.85), inset 0 0 90px rgba(255,40,40,.35)" : "none", transition: "all .14s" }
+					},
+						React.createElement("div", { style: { fontSize: dragOver ? 24 : 15, fontWeight: 700, whiteSpace: "pre-line", lineHeight: 1.65, color: dragOver ? "#ff6b6b" : "#a9adc7" } }, dragOver ? "松手开始播放 ▶" : "🃏 把卡片拖到这里\n松手开始播放")
+					),
+					React.createElement("div", {
+						onClick: (e) => e.stopPropagation(),
+						style: { position: "absolute", bottom: 22, left: 0, right: 0, display: "flex", gap: 16, justifyContent: "center", flexWrap: "wrap", padding: "0 20px" }
+					}, cards.map((c, k) => HsCardEl(c, k)))
+				);
+			}
+
 
 			// 流式补理由序号：play() 播放时递增以取消在途的逐条生成
 			let reasonSeq = 0;
+			const autoPlaySeen = new Set();   // 本会话已自动播放过的结果文本，防重复播放
 
 			function AskResultRow(props) {
 				const node = props && props.node;
-				const [cards, setCards] = React.useState(null);
-				const [phase, setPhase] = React.useState("idle");
-				const fired = React.useRef(false);
+				const outcome = node && node.outcome;
+				const text = outcome && outcome.kind === "success" ? String(outcome.text || "") : "";
+				// 卡片从命令结果直接派生（node 一更新就重新解析，不依赖 effect 时序）
+				let cards = null;
+				if (text) {
+					const m = text.match(/CARDS:([A-Za-z0-9+/=]+)/);
+					if (m) { try { cards = JSON.parse(window.atob(m[1])); } catch (e) {} }
+				}
+				const argText = node && node.args ? (Array.isArray(node.args) ? node.args.join(" ") : String(node.args)) : "";
+				const queryText = argText.replace(/^AI\s+/i, "").trim();
+				const label = "\U0001F0CF " + (queryText || "AI 推荐");
+				const [reasons, setReasons] = React.useState({});
+				const [phase, setPhase] = React.useState(outcome ? (outcome.kind === "success" ? "done" : "err") : "exec");
+				const firedKey = React.useRef("");
+				const merged = cards && cards.length ? cards.map((c, i) => (reasons[i] ? Object.assign({}, c, { reason: reasons[i] }) : c)) : null;
+				// 新命令结果到来时清空上一批理由
+				React.useEffect(() => { setReasons({}); }, [text]);
+				// 合并后的卡片同步到顶层浮层（主动弹出通道）
 				React.useEffect(() => {
-					if (!node || fired.current) return;
-					if (node.outcome === null) { setPhase("exec"); return; }
-					fired.current = true;
-					if (node.outcome.kind !== "success") { setPhase("err"); return; }
-					const t = String(node.outcome.text || "");
-					const c = t.match(/CARDS:([A-Za-z0-9+/=]+)/);
-					if (c) {
-						try {
-							const parsed = JSON.parse(window.atob(c[1]));
-							setCards(parsed); setPhase("cards");
-							startReasons(parsed, String(node.args || "").replace(/^AI\s+/i, ""));
-							return;
-						} catch (e) {}
+					if (merged && merged.length) setOverlayCards(merged, label);
+				}, [text, reasons]);
+				React.useEffect(() => {
+					if (!outcome) { setPhase("exec"); return; }
+					if (outcome.kind !== "success") { setPhase("err"); return; }
+					setPhase(merged && merged.length ? "cards" : "none");
+					if (firedKey.current !== text && cards && cards.length) {
+						firedKey.current = text;
+						startReasons(cards, label);
+					} else if (text && !autoPlaySeen.has(text)) {
+						const b = text.match(/BV[0-9A-Za-z]{10,}/);
+						if (b) { autoPlaySeen.add(text); play(b[0]); }
 					}
-					setPhase("none");
-					const b = t.match(/BV[0-9A-Za-z]{10}/);
-					if (b) play(b[0]);
-				}, [node]);
+				}, [outcome]);
 				// 逐条异步补推荐理由（间隔 ~400ms 模拟流式；播放后 reasonSeq 变化即停止）
-				const startReasons = (list, query) => {
+				const startReasons = (list, srcLabel) => {
 					const mine = ++reasonSeq;
 					(async () => {
 						for (let i = 0; i < list.length; i++) {
 							if (reasonSeq !== mine) return;
 							const it = list[i];
-							if (!it || it.reason) continue;
+							if (!it) continue;
 							try {
 								const r = await fetch("/ambient-ai/reason", {
 									method: "POST", headers: { "Content-Type": "application/json" },
-									body: JSON.stringify({ query: query || "", item: { title: it.title, up: it.up, duration: it.duration, bvid: it.bvid } }),
+									body: JSON.stringify({ query: (srcLabel || "").replace(/^\S+\s*/, ""), item: { title: it.title, up: it.up, duration: it.duration, bvid: it.bvid } }),
 								}).then((x) => x.json());
 								if (reasonSeq !== mine) return;
-								if (r && r.ok && r.reason) {
-									setCards((prev) => { const nx = (prev || []).slice(); nx[i] = Object.assign({}, nx[i], { reason: r.reason }); return nx; });
-								}
+								if (r && r.ok && r.reason) setReasons((prev) => Object.assign({}, prev, { [i]: r.reason }));
 							} catch (e) { /* 单条失败跳过 */ }
 							await new Promise((res) => setTimeout(res, 400));
 						}
 					})();
 				};
-				const header = !node ? "" : phase === "exec" ? "⏳ 执行中…" : phase === "err" ? "❌ " + (node.outcome.text || "失败") : phase === "cards" ? "🃏 拖牌到中间，松手播放（理由生成中…）" : "▶ " + (node.outcome.text || "完成");
+				const header = !node ? "" : phase === "exec" ? "\u23F3 执行中…" : phase === "err" ? "\u274C " + (outcome && outcome.text || "失败") : phase === "cards" ? "\U0001F0CF 已推荐 " + cards.length + " 张，卡片浮层已展开（理由逐条生成中…）" : "\u25B6 " + (text || "完成");
 				return React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 8, padding: "4px 0" } },
 					React.createElement("div", { style: { fontSize: 12, color: "var(--dsw-alias-label-secondary)", fontFamily: "var(--ds-font-family-code, monospace)", overflowWrap: "anywhere" } },
-						"/" + (node && node.name ? node.name : "") + (node && node.args ? " " + node.args : "")),
+						"/" + (node && node.name ? node.name : "") + (argText ? " " + argText : "")),
 					React.createElement("div", { style: { fontSize: 12, color: phase === "err" ? "var(--dsw-alias-state-error-primary)" : "var(--dsw-alias-label-secondary)" } }, header),
-					cards && cards.length ? HsCards(cards) : null
+					phase === "cards" && cards && cards.length ? React.createElement("button", {
+						onClick: () => setOverlayCards(merged, label),
+						style: { alignSelf: "flex-start", padding: "4px 10px", fontSize: 11, borderRadius: 6, cursor: "pointer", background: "var(--dsw-alias-state-accent-secondary, rgba(120,130,200,.18))", color: "var(--dsw-alias-label-primary)", border: "1px solid var(--dsw-alias-state-accent-primary, rgba(120,130,200,.4))" }
+					}, "\U0001F501 重新展开卡片") : null
 				);
 			}
 
@@ -497,13 +576,18 @@ window.__ModuleLoader__.load({
 					if (node.outcome === null) return;
 					fired.current = true;
 					if (node.outcome.kind !== "success") return;
-					setCards(getHistory());
+					const h = getHistory();
+					setCards(h);
+					if (h && h.length) setOverlayCards(h, "🕘 播放历史");
 				}, [node]);
-				const header = !node ? "" : node.outcome === null ? "⏳ 读取历史…" : "🃏 拖牌到中间，松手播放（点击无效）：";
+				const header = !node ? "" : node.outcome === null ? "⏳ 读取历史…" : (cards && cards.length ? "🕘 共 " + cards.length + " 条，卡片浮层已展开" : "暂无播放历史，先播放几个视频吧");
 				return React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 8, padding: "4px 0" } },
 					React.createElement("div", { style: { fontSize: 12, color: "var(--dsw-alias-label-secondary)", fontFamily: "var(--ds-font-family-code, monospace)", overflowWrap: "anywhere" } }, "/playhistory"),
 					React.createElement("div", { style: { fontSize: 12, color: "var(--dsw-alias-label-secondary)" } }, header),
-					cards && cards.length ? HsCards(cards) : (node && node.outcome && node.outcome.kind === "success" ? React.createElement("div", { style: { fontSize: 12, color: "var(--dsw-alias-label-secondary)" } }, "暂无播放历史，先播放几个视频吧") : null)
+					cards && cards.length ? React.createElement("button", {
+					onClick: () => setOverlayCards(cards, "🕘 播放历史"),
+					style: { alignSelf: "flex-start", padding: "4px 10px", fontSize: 11, borderRadius: 6, cursor: "pointer", background: "var(--dsw-alias-state-accent-secondary, rgba(120,130,200,.18))", color: "var(--dsw-alias-label-primary)", border: "1px solid var(--dsw-alias-state-accent-primary, rgba(120,130,200,.4))" }
+				}, "🔁 重新展开卡片") : null
 				);
 			}
 
@@ -764,7 +848,7 @@ s.uiOpen.ai ? React.createElement("div", null,
 						React.createElement("span", { style: labelStyle }, "地址"),
 						React.createElement("input", {
 							value: s.aiBase,
-							onChange: (e) => setState({ aiBase: e.target.value }),
+							onChange: (e) => { setState({ aiBase: e.target.value }); syncConfig(); },
 							placeholder: "OpenAI 兼容端点，如 http://127.0.0.1:8000/v1", spellCheck: false,
 							style: Object.assign({}, inputBase, { width: "100%", height: 30, padding: "0 10px", fontSize: 12 }),
 						}),
@@ -773,7 +857,7 @@ s.uiOpen.ai ? React.createElement("div", null,
 						React.createElement("span", { style: labelStyle }, "模型"),
 						React.createElement("input", {
 							value: s.aiModel,
-							onChange: (e) => setState({ aiModel: e.target.value }),
+							onChange: (e) => { setState({ aiModel: e.target.value }); syncConfig(); },
 							placeholder: "如 Qwen3.5-4B-AWQ", spellCheck: false,
 							style: Object.assign({}, inputBase, { width: "100%", height: 30, padding: "0 10px", fontSize: 12 }),
 						}),
@@ -824,7 +908,7 @@ s.uiOpen.ai ? React.createElement("div", null,
 						React.createElement("span", { style: labelStyle }, "地址"),
 						React.createElement("input", {
 							value: s.reasonBase,
-							onChange: (e) => setState({ reasonBase: e.target.value }),
+							onChange: (e) => { setState({ reasonBase: e.target.value }); syncConfig(); },
 							placeholder: "留空=用选卡 AI 的地址", spellCheck: false,
 							style: Object.assign({}, inputBase, { width: "100%", height: 30, padding: "0 10px", fontSize: 12 }),
 						}),
@@ -833,7 +917,7 @@ s.uiOpen.ai ? React.createElement("div", null,
 						React.createElement("span", { style: labelStyle }, "模型"),
 						React.createElement("input", {
 							value: s.reasonModel,
-							onChange: (e) => setState({ reasonModel: e.target.value }),
+							onChange: (e) => { setState({ reasonModel: e.target.value }); syncConfig(); },
 							placeholder: "留空=用选卡 AI 的模型", spellCheck: false,
 							style: Object.assign({}, inputBase, { width: "100%", height: 30, padding: "0 10px", fontSize: 12 }),
 						}),
@@ -958,6 +1042,10 @@ s.uiOpen.fav ? React.createElement("div", null,
 			slots.inject("shell.overlay", () => slots.register(
 				{ name: "shell.overlay", id: "bilibili-bg", order: 100, label: "背景视频" },
 				() => React.createElement(BgVideo)
+			));
+			slots.inject("shell.overlay", () => slots.register(
+				{ name: "shell.overlay", id: "bilibili-cards", order: 200, label: "推荐卡片浮层" },
+				() => React.createElement(CardOverlay)
 			));
 			slots.inject("settings.section", () => slots.register(
 				{ name: "settings.section", id: "bilibili-bg", order: 50, label: "背景视频" },

@@ -22,6 +22,7 @@ function apply(ctx) {
   const webServer = ctx.get('webServer')
   const web = ctx.get('web')
   const shell = ctx.get('shell')
+  const llm = ctx.get('llm')   // DSH 统一模型服务（provider 在 settings.yaml 配好）
   const timer = ctx.get('timer')
 
   // ---- 运行期配置（客户端 localStorage 持久化，启动时 POST 同步过来）----
@@ -82,6 +83,7 @@ function apply(ctx) {
   }
 
   // ---- AI 推荐配置（客户端设置页选择后端）----
+  let aiProvider = 'vllm-local'   // DSH provider route（settings.yaml -> llm-pi-ai.providers）
   let aiBase = 'http://127.0.0.1:8000/v1'
   let aiModel = ''
   let aiKey = ''
@@ -92,8 +94,31 @@ function apply(ctx) {
   let reasonModel = ''
   let reasonKey = ''
   let reasonEnabled = true
+  let reasonProvider = ''   // 空 = 跟随 aiProvider
+  // 最近一次 AI 选卡结果（供客户端轮询 /ambient-ask/state，绕过聊天行渲染时序）
+  let askSeq = 0
+  let askLast = null
+
+  // provider 已配但模型名留空时，自动取该 provider 的第一个模型
+  async function resolveModel(provider, wanted) {
+    if (wanted) return wanted
+    if (!llm || !provider) return ''
+    try {
+      const ms = await llm.listModels(provider)
+      if (ms && ms.length) return String((ms[0] && ms[0].id) || '')
+    } catch (e) {}
+    return ''
+  }
 
   async function aiModels(cfg) {
+    const provider = (cfg && cfg.provider) || aiProvider
+    if (llm && provider) {
+      try {
+        const ms = await llm.listModels(provider)
+        const ids = (ms || []).map((m) => String(m.id || '')).filter(Boolean)
+        if (ids.length) return ids
+      } catch (e) { /* 回落 */ }
+    }
     const base = (cfg && cfg.base) || aiBase
     const key = (cfg && cfg.key) || aiKey
     if (!shell || !base) return []
@@ -107,9 +132,29 @@ function apply(ctx) {
     } catch (e) { return [] }
   }
 
+  // ---- AI 调用：优先走 DSH 的 llm 服务（与 /speak 同源，provider 在 settings.yaml 配好）----
+  // ---- llm 服务不可用时回落到直接 curl vLLM（临时文件必须在 curl 读完之后才删）----
   async function aiChat(userContent, maxTokens, cfg) {
+    const provider = (cfg && cfg.provider) || aiProvider
+    const model = await resolveModel(provider, (cfg && cfg.model) || aiModel)
+    if (llm && provider && model) {
+      try {
+        let sys = ''
+        const msgs = []
+        for (const m of userContent || []) {
+          if (!m || typeof m !== 'object') continue
+          const t = String(m.content || '')
+          if (m.role === 'system') { sys = sys ? sys + '\n' + t : t; continue }
+          msgs.push({ id: 'ai-' + msgs.length, role: m.role === 'assistant' ? 'assistant' : 'user', content: [{ type: 'text', text: t }], source: { kind: m.role === 'assistant' ? 'model' : 'user' } })
+        }
+        const stream = llm.stream({ provider: provider, model: model, reasoningEffort: 'off', system: sys || undefined, messages: msgs, maxTokens: maxTokens || 1024, temperature: 0.3 })
+        let buf = ''
+        for await (const c of stream) { if (c && c.type === 'text-delta') buf += c.text }
+        const out = buf.trim()
+        if (out) return out
+      } catch (e) { /* 回落 curl */ }
+    }
     const base = (cfg && cfg.base) || aiBase
-    const model = (cfg && cfg.model) || aiModel
     const key = (cfg && cfg.key) || aiKey
     if (!shell || !base) return null
     const body = { model: model || 'local-model', messages: userContent, temperature: 0.3, max_tokens: maxTokens || 1024 }
@@ -117,9 +162,13 @@ function apply(ctx) {
     fs.writeFileSync(tmp, JSON.stringify(body))
     const h = key ? ' -H ' + JSON.stringify('Authorization: Bearer ' + key) : ''
     const cmd = 'curl -s --max-time 40 -X POST -H ' + JSON.stringify('Content-Type: application/json') + h + ' -d @' + JSON.stringify(tmp) + ' ' + JSON.stringify(base.replace(/\/+$/, '') + '/chat/completions')
-    try { fs.unlinkSync(tmp) } catch (e) {}
-    const spec = shell.resolve({ command: cmd, timeoutMs: 45000, stdoutMaxBytes: 1048576 })
-    const r = await shell.run(spec)
+    let r
+    try {
+      const spec = shell.resolve({ command: cmd, timeoutMs: 45000, stdoutMaxBytes: 1048576 })
+      r = await shell.run(spec)
+    } finally {
+      try { fs.unlinkSync(tmp) } catch (e) {}   // 必须在 curl 读完后才能删
+    }
     try {
       const d = JSON.parse(r && r.stdout ? (r.stdout.text || '') : '')
       const msg = d && d.choices && d.choices[0] && d.choices[0].message ? String(d.choices[0].message.content || '') : ''
@@ -277,16 +326,18 @@ function apply(ctx) {
               cookieSource = typeof p.cookieSource === 'string' ? p.cookieSource : 'paste'
             }
             if (typeof p.aiEnabled === 'boolean') aiEnabled = p.aiEnabled
+            if (typeof p.aiProvider === 'string' && p.aiProvider.trim()) aiProvider = p.aiProvider.trim()
             if (typeof p.aiBase === 'string' && p.aiBase.trim()) aiBase = p.aiBase.trim().replace(/\/+$/, '')
             if (typeof p.aiModel === 'string') aiModel = p.aiModel.trim()
             if (typeof p.aiKey === 'string') aiKey = p.aiKey.trim()
             const ac = Number(p.aiCount) || 3
             if (ac >= 1 && ac <= 5) aiCount = ac
             if (typeof p.reasonEnabled === 'boolean') reasonEnabled = p.reasonEnabled
+            if (typeof p.reasonProvider === 'string') reasonProvider = p.reasonProvider.trim()
             if (typeof p.reasonBase === 'string') reasonBase = p.reasonBase.trim().replace(/\/+$/, '')
             if (typeof p.reasonModel === 'string') reasonModel = p.reasonModel.trim()
             if (typeof p.reasonKey === 'string') reasonKey = p.reasonKey.trim()
-            json(res, { ok: true, proxy: searchProxy, localRoot, cookieSet: !!biliCookieStr, cookieSource, aiEnabled, aiBase, aiModel, aiSet: !!aiModel, reasonEnabled, reasonBase, reasonModel })
+            json(res, { ok: true, proxy: searchProxy, localRoot, cookieSet: !!biliCookieStr, cookieSource, aiEnabled, aiProvider, aiBase, aiModel, aiSet: !!aiModel, reasonEnabled, reasonProvider, reasonBase, reasonModel })
           } catch (e) {
             json(res, { ok: false }, 500)
           }
@@ -803,7 +854,7 @@ function apply(ctx) {
         const u = new URL(req.url || '/', 'http://internal')
         const kind = String(u.searchParams.get('kind') || '')
         const models = kind === 'reason'
-          ? await aiModels({ base: reasonBase || aiBase, key: reasonKey || aiKey })
+          ? await aiModels({ provider: reasonProvider || aiProvider, base: reasonBase || aiBase, key: reasonKey || aiKey })
           : await aiModels()
         json(res, { ok: models.length > 0, models })
       },
@@ -830,7 +881,7 @@ function apply(ctx) {
             const msg = await aiChat([
               { role: 'system', content: sys },
               { role: 'user', content: '用户需求：' + query + '\n视频：' + (title || '未知') + '（UP:' + (up || '未知') + '，时长' + Math.round(dur / 60) + '分钟）\n请写推荐理由。' },
-            ], 256, { base: reasonBase || aiBase, model: reasonModel || aiModel, key: reasonKey || aiKey })
+            ], 256, { provider: reasonProvider || aiProvider, base: reasonBase || aiBase, model: reasonModel || aiModel, key: reasonKey || aiKey })
             const reason = msg ? String(msg).trim().replace(/^["'“”\s]+|["'“”\s]+$/g, '').slice(0, 120) : ''
             json(res, { ok: !!reason, reason })
           } catch (e) { json(res, { ok: false, error: 'fail' }) }
@@ -838,6 +889,15 @@ function apply(ctx) {
       },
     })
     ctx.effect(() => offAiReason)
+    // 最近一次 AI 选卡结果快照（客户端轮询用）
+    const offAskState = webServer.register({
+      kind: 'exact',
+      path: '/ambient-ask/state',
+      handler: (req, res) => {
+        json(res, { ok: !!askLast, seq: askSeq, cards: askLast ? askLast.cards : null, query: askLast ? askLast.query : '', at: askLast ? askLast.at : 0 })
+      },
+    })
+    ctx.effect(() => offAskState)
 
     // ---- 浏览器 Cookie 读取 ----
     const offCookieRead = webServer.register({
@@ -1104,7 +1164,9 @@ print(json.dumps(out))\n')
       const payload = Buffer.from(JSON.stringify(cards)).toString('base64')
       await delay()
       const names = cards.map((c) => '「' + c.title + '」').join('、')
-      return { kind: 'success', text: '🤖 AI 选卡：' + names + '（理由生成中…）\nCARDS:' + payload }
+      askSeq += 1; askLast = { seq: askSeq, cards: cards, query: String(desc || ''), at: Date.now() }
+      const head = aiEnabled ? '🤖 AI 选卡：' + names : '🤖 选卡 AI 未开启（按原顺序取前 ' + cards.length + ' 条）：' + names
+      return { kind: 'success', text: head + '（理由生成中…）\nCARDS:' + payload }
     }
     // AI 国外搜索选片（/playsearchw AI <描述>）
     async function aiForeignPick(desc) {
@@ -1137,7 +1199,9 @@ print(json.dumps(out))\n')
       const payload = Buffer.from(JSON.stringify(cards)).toString('base64')
       await delay()
       const names = cards.map((c) => '「' + c.title + '」').join('、')
-      return { kind: 'success', text: '🤖 AI 选卡：' + names + '（理由生成中…）\nCARDS:' + payload }
+      askSeq += 1; askLast = { seq: askSeq, cards: cards, query: String(desc || ''), at: Date.now() }
+      const head = aiEnabled ? '🤖 AI 选卡：' + names : '🤖 选卡 AI 未开启（按原顺序取前 ' + cards.length + ' 条）：' + names
+      return { kind: 'success', text: head + '（理由生成中…）\nCARDS:' + payload }
     }
 
     const offUrl = commands.register({
