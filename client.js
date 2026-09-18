@@ -513,9 +513,11 @@ window.__ModuleLoader__.load({
 				const queryText = argText.replace(/^AI\s+/i, "").trim();
 				const label = "\U0001F0CF " + (queryText || "AI 推荐");
 				const [reasons, setReasons] = React.useState({});
-				const [phase, setPhase] = React.useState(outcome ? (outcome.kind === "success" ? "done" : "err") : "exec");
+				const [phase, setPhase] = React.useState(!outcome ? "exec" : outcome.kind !== "success" ? "err" : (cards && cards.length ? "cards" : "none"));
 				const firedKey = React.useRef("");
 				const merged = cards && cards.length ? cards.map((c, i) => (reasons[i] ? Object.assign({}, c, { reason: reasons[i] }) : c)) : null;
+		// 展示文本一律剥掉 CARDS: 后的 base64 载荷（那串就是用户看到的"乱码"）
+		const displayText = text.indexOf("CARDS:") >= 0 ? text.slice(0, text.indexOf("CARDS:")).trim() : text;
 				// 新命令结果到来时清空上一批理由
 				React.useEffect(() => { setReasons({}); }, [text]);
 				// 合并后的卡片同步到顶层浮层（主动弹出通道）
@@ -554,7 +556,7 @@ window.__ModuleLoader__.load({
 						}
 					})();
 				};
-				const header = !node ? "" : phase === "exec" ? "\u23F3 执行中…" : phase === "err" ? "\u274C " + (outcome && outcome.text || "失败") : phase === "cards" ? "\U0001F0CF 已推荐 " + cards.length + " 张，卡片浮层已展开（理由逐条生成中…）" : "\u25B6 " + (text || "完成");
+				const header = !node ? "" : phase === "exec" ? "\u23F3 执行中…" : phase === "err" ? "\u274C " + (outcome && outcome.text || "失败") : phase === "cards" ? "\U0001F0CF 已推荐 " + cards.length + " 张，卡片浮层已展开（理由逐条生成中…）" : "\u25B6 " + (displayText || "完成");
 				return React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 8, padding: "4px 0" } },
 					React.createElement("div", { style: { fontSize: 12, color: "var(--dsw-alias-label-secondary)", fontFamily: "var(--ds-font-family-code, monospace)", overflowWrap: "anywhere" } },
 						"/" + (node && node.name ? node.name : "") + (argText ? " " + argText : "")),
