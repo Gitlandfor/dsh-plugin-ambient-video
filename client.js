@@ -193,7 +193,7 @@ window.__ModuleLoader__.load({
 						if (rec) { rec.title = r.title || rec.title; rec.pic = r.pic || rec.pic; rec.duration = r.duration || rec.duration; window.localStorage.setItem(HISTORY_KEY, JSON.stringify(h)); }
 					} catch (e) { /* ignore */ }
 					setState({
-						src: "/ambient-proxy?url=" + encodeURIComponent(r.url),
+						src: r.tk ? "/ambient-proxy?t=" + r.tk : "/ambient-proxy?url=" + encodeURIComponent(r.url),
 						native: true, nativeLoop: true, duration: r.duration || 0, pic: r.pic || "",
 						loopInfo: "B站VOD（原生480P循环）：" + (r.title || parsed.bvid),
 						error: "",

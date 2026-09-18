@@ -496,6 +496,10 @@ function apply(ctx) {
 
     // ---- B站 VOD 直链解析 ?bvid= &page= → {url: durl mp4 直链, duration, title}（fnval=1 老式 durl，480P 匿名可拿）----
     let playurlCache = { at: 0, key: '', url: '', duration: 0, title: '' }
+    // 播放令牌：直链由 /ambient-playurl 铸造，浏览器只拿 token 不拿 URL
+    // （原 ?url= 白名单只含 bilivideo/bilibili/hdslb，B站第三方 CDN 如 mountaintoys.cn 会被 403；
+    //  且客户端传 URL 有 SSRF 面。token 由 Host 自己签，代理查表取链，天然安全且不限 CDN）
+    const playTokens = new Map()
     const offPlayurl = webServer.register({
       kind: 'exact',
       path: '/ambient-playurl',
@@ -506,8 +510,9 @@ function apply(ctx) {
           const page = Number(u.searchParams.get('page') || '1') || 1
           if (!/^BV[0-9A-Za-z]+$/.test(bvid)) { json(res, { ok: false, error: 'bad-bvid' }); return }
           const key = bvid + '|' + page
+          const mint = (u) => { const tk = crypto.randomBytes(12).toString('base64url'); playTokens.set(tk, u); if (playTokens.size > 60) { const first = playTokens.keys().next().value; if (first) playTokens.delete(first) }; return tk }
           if (playurlCache.key === key && Date.now() - playurlCache.at < 15000) {
-            json(res, { ok: true, url: playurlCache.url, duration: playurlCache.duration, title: playurlCache.title, pic: playurlCache.pic || '', cached: true })
+            json(res, { ok: true, url: playurlCache.url, tk: mint(playurlCache.url), duration: playurlCache.duration, title: playurlCache.title, pic: playurlCache.pic || '', cached: true })
             return
           }
           if (!shell) { json(res, { ok: false, error: 'no-shell' }); return }
@@ -537,7 +542,7 @@ function apply(ctx) {
           const url = String(pd.data.durl[0].url || '')
           if (!url) { json(res, { ok: false, error: 'no-durl' }); return }
           playurlCache = { at: Date.now(), key, url, duration: Number(vd.data.duration) || 0, title: String(vd.data.title || ''), pic: String(vd.data.pic || '') }
-          json(res, { ok: true, url, duration: playurlCache.duration, title: playurlCache.title, pic: playurlCache.pic })
+          json(res, { ok: true, url, tk: mint(url), duration: playurlCache.duration, title: playurlCache.title, pic: playurlCache.pic })
         } catch (e) { json(res, { ok: false, error: 'playurl-fail' }) }
       },
     })
@@ -550,12 +555,18 @@ function apply(ctx) {
       handler: (req, res) => {
         try {
           const u = new URL(req.url || '/', 'http://internal')
-          const target = String(u.searchParams.get('url') || '')
-          // 白名单：只允许 bilibili 的 CDN 域名（防 SSRF）
-          const m = target.match(/^https?:\/\/([^/]+)/)
-          if (!m || !/(^|\.)(bilivideo\.com|bilibili\.com|hdslb\.com)$/i.test(m[1])) {
-            try { res.writeHead(403, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'domain-not-allowed' })) } catch (e) {}
-            return
+          const tk = String(u.searchParams.get('t') || '')
+          const cachedTarget = tk ? (playTokens.get(tk) || '') : ''
+          const target = cachedTarget || String(u.searchParams.get('url') || '')
+          if (!target) { try { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'no-target' })) } catch (e) {} return }
+          // 直传 ?url= 走白名单（只允许 bilibili CDN，防 SSRF）；
+          // ?t= 是 Host 自己签的令牌，已在上一步查表取链，无需域名限制
+          if (!cachedTarget) {
+            const m = target.match(/^https?:\/\/([^/]+)/)
+            if (!m || !/(^|\.)(bilivideo\.com|bilibili\.com|hdslb\.com)$/i.test(m[1])) {
+              try { res.writeHead(403, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'domain-not-allowed' })) } catch (e) {}
+              return
+            }
           }
           // 用 http/https 模块转发（带 Referer/UA + Range），数据流式 pipe
           const mod = target.startsWith('https:') ? https : http
