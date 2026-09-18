@@ -147,7 +147,7 @@ function apply(ctx) {
           if (m.role === 'system') { sys = sys ? sys + '\n' + t : t; continue }
           msgs.push({ id: 'ai-' + msgs.length, role: m.role === 'assistant' ? 'assistant' : 'user', content: [{ type: 'text', text: t }], source: { kind: m.role === 'assistant' ? 'model' : 'user' } })
         }
-        const stream = llm.stream({ provider: provider, model: model, reasoningEffort: 'off', system: sys || undefined, messages: msgs, maxTokens: maxTokens || 1024, temperature: 0.3 })
+        const stream = llm.stream({ provider: provider, model: model, system: sys || undefined, messages: msgs, maxTokens: maxTokens || 1024, temperature: 0.3 })
         let buf = ''
         for await (const c of stream) { if (c && c.type === 'text-delta') buf += c.text }
         const out = buf.trim()
