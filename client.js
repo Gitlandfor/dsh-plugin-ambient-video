@@ -57,6 +57,7 @@ window.__ModuleLoader__.load({
 				proxy: "http://127.0.0.1:7897", localRoot: "", cookie: "", cookieSource: "",
 				jfServer: "", jfUser: "", jfPass: "", jfStatus: "",
 				aiEnabled: true, aiBase: "http://127.0.0.1:8000/v1", aiModel: "", aiKey: "", aiCount: 3, aiModels: [], aiStatus: "",
+				uiOpen: { play: true, display: true, local: false, live: false, jf: false, ai: false, fav: false },
 				reasonEnabled: true, reasonBase: "", reasonModel: "", reasonKey: "", reasonModels: [], reasonStatus: "",
 				duration: 0, loopInfo: "", error: "",
 				native: false, nativeLoop: false, liveFormat: "", probe: "",
@@ -509,8 +510,10 @@ window.__ModuleLoader__.load({
 			// ---- 设置页 ----
 			function BiliSettings() {
 				const s = useStore();
+				const toggle = (k) => setState({ uiOpen: Object.assign({}, s.uiOpen, { [k]: !s.uiOpen[k] }) });
 				return React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 14, maxWidth: 720, padding: "4px 2px" } },
-					React.createElement("div", { style: { color: "var(--dsw-alias-label-primary)", fontSize: 15, fontWeight: 600 } }, "氛围背景视频"),
+					React.createElement("div", { style: { color: "var(--dsw-alias-label-primary)", fontSize: 15, fontWeight: 600 } }, "氛围背景视频" + (s.uiOpen.play ? " ▾" : " ▸")),
+s.uiOpen.play ? React.createElement("div", null,
 					React.createElement("div", { style: subStyle },
 						"命令：/playurl <链接|路径|live:房间号|twitch:频道>、/playsearch <关键词 或 AI <描述>>、/playsearchw <关键词 或 AI <描述>>、/playstop。设置自动保存。"
 					),
@@ -542,7 +545,61 @@ window.__ModuleLoader__.load({
 					React.createElement("div", { style: subStyle }, "供外网搜索/兜底翻墙用（AnySearch）。默认本机 Clash；没有代理就留空。"),
 
 					// ---- 本地视频 ----
-					React.createElement("div", { style: sectionTitle }, "🖥 本地视频（原生解码）"),
+) : null,
+					React.createElement("div", { style: Object.assign({}, sectionTitle, { cursor: "pointer", userSelect: "none" }), onClick: () => toggle("display") }, "显示与循环" + (s.uiOpen.display ? " ▾" : " ▸")),
+s.uiOpen.display ? React.createElement("div", null,
+					React.createElement("div", { style: row },
+						React.createElement("span", { style: labelStyle }, "背景透明度"),
+						React.createElement("input", {
+							type: "range", min: 0, max: 100, value: Math.round(s.opacity * 100),
+							onChange: (e) => setState({ opacity: Number(e.target.value) / 100 }), style: { flex: 1 },
+						}),
+						React.createElement("span", { style: { color: "var(--dsw-alias-label-secondary)", fontSize: 12, width: 44, textAlign: "right" } }, Math.round(s.opacity * 100) + "%")
+					),
+					React.createElement("div", { style: row },
+						React.createElement("span", { style: labelStyle }, "背景亮度"),
+						React.createElement("input", {
+							type: "range", min: 50, max: 200, step: 5, value: Math.round(s.brightness * 100),
+							onChange: (e) => setState({ brightness: Number(e.target.value) / 100 }), style: { flex: 1 },
+						}),
+						React.createElement("span", { style: { color: "var(--dsw-alias-label-secondary)", fontSize: 12, width: 44, textAlign: "right" } }, Math.round(s.brightness * 100) + "%")
+					),
+					React.createElement("div", { style: row },
+						React.createElement("span", { style: labelStyle }, "毛玻璃强度"),
+						React.createElement("input", {
+							type: "range", min: 0, max: 30, step: 1, value: s.blur,
+							onChange: (e) => setState({ blur: Number(e.target.value) }), style: { flex: 1 },
+						}),
+						React.createElement("span", { style: { color: "var(--dsw-alias-label-secondary)", fontSize: 12, width: 44, textAlign: "right" } }, s.blur + "px")
+					),
+					React.createElement("label", { style: row },
+						React.createElement("input", {
+							type: "checkbox", checked: s.loop,
+							onChange: (e) => {
+								const loop = e.target.checked;
+								setState({ loop });
+								if (!loop) { clearLoopAll(); setState({ loopInfo: "" }); }
+								else if (state.playing && state.src) play(state.draft);
+							},
+						}),
+						React.createElement("span", { style: labelStyle }, "单曲循环")
+					),
+					s.loopInfo ? React.createElement("div", { style: subStyle }, "循环状态：" + s.loopInfo) : null,
+
+					React.createElement("label", { style: row },
+						React.createElement("input", {
+							type: "checkbox", checked: s.mute,
+							onChange: (e) => {
+								const mute = e.target.checked;
+								setState({ mute });
+								if (state.playing && state.src) play(state.draft);
+							},
+						}),
+						React.createElement("span", { style: labelStyle }, "静音播放（B站VOD静音时无声卡信号，不循环）")
+					),
+) : null,
+					React.createElement("div", { style: Object.assign({}, sectionTitle, { cursor: "pointer", userSelect: "none" }), onClick: () => toggle("local") }, "🖥 本地视频（原生解码）" + (s.uiOpen.local ? " ▾" : " ▸")),
+s.uiOpen.local ? React.createElement("div", null,
 					React.createElement("div", { style: row },
 						React.createElement("span", { style: labelStyle }, "根目录"),
 						React.createElement("input", {
@@ -598,7 +655,9 @@ window.__ModuleLoader__.load({
 					React.createElement("div", { style: subStyle }, "MP4/WebM 直接原生解码；MKV/AVI/FLV 自动 ffmpeg 转封装（不重编码）；HEVC/高规格编码浏览器解不了，请用下方 Jellyfin。"),
 
 					// ---- 直播 ----
-					React.createElement("div", { style: sectionTitle }, "📡 直播"),
+) : null,
+					React.createElement("div", { style: Object.assign({}, sectionTitle, { cursor: "pointer", userSelect: "none" }), onClick: () => toggle("live") }, "📡 直播" + (s.uiOpen.live ? " ▾" : " ▸")),
+s.uiOpen.live ? React.createElement("div", null,
 					React.createElement("div", { style: row },
 						React.createElement("input", {
 							value: s.draft,
@@ -620,7 +679,9 @@ window.__ModuleLoader__.load({
 					React.createElement("div", { style: subStyle }, "B站直播走原生 FLV/HLS 流（无需登录）；Twitch 走官方嵌入播放器（需要浏览器能翻墙，parent 已自动填）。"),
 
 					// ---- Jellyfin ----
-					React.createElement("div", { style: sectionTitle }, "🎞 Jellyfin（高规格视频解码）"),
+) : null,
+					React.createElement("div", { style: Object.assign({}, sectionTitle, { cursor: "pointer", userSelect: "none" }), onClick: () => toggle("jf") }, "🎞 Jellyfin（高规格视频解码）" + (s.uiOpen.jf ? " ▾" : " ▸")),
+s.uiOpen.jf ? React.createElement("div", null,
 					React.createElement("div", { style: row },
 						React.createElement("input", {
 							value: s.jfServer,
@@ -688,7 +749,9 @@ window.__ModuleLoader__.load({
 					React.createElement("div", { style: subStyle }, "点卡片在本插件里原生循环播放（HLS 串流，服务端自动适配转码，HEVC/4K 也能解）。"),
 
 					// ---- AI 推荐（选卡 AI 与补理由 AI 分开配置）----
-					React.createElement("div", { style: sectionTitle }, "🤖 AI 推荐"),
+) : null,
+					React.createElement("div", { style: Object.assign({}, sectionTitle, { cursor: "pointer", userSelect: "none" }), onClick: () => toggle("ai") }, "🤖 AI 推荐" + (s.uiOpen.ai ? " ▾" : " ▸")),
+s.uiOpen.ai ? React.createElement("div", null,
 					React.createElement("div", { style: { fontSize: 13, fontWeight: 600, color: "var(--dsh-alias-label-primary)", marginTop: 6 } }, "🎯 选卡 AI（/playsearch AI 选片）"),
 					React.createElement("label", { style: row },
 						React.createElement("input", {
@@ -807,7 +870,9 @@ window.__ModuleLoader__.load({
 					React.createElement("div", { style: subStyle }, "/playsearch AI <描述> 选卡（🎯）；卡片理由逐条生成（✍️）。两套 AI 可分别配置：选卡用快的，理由用好的。"),
 
 					// ---- B站收藏 ----
-					React.createElement("div", { style: sectionTitle }, "⭐ B站收藏推荐"),
+) : null,
+					React.createElement("div", { style: Object.assign({}, sectionTitle, { cursor: "pointer", userSelect: "none" }), onClick: () => toggle("fav") }, "⭐ B站收藏推荐" + (s.uiOpen.fav ? " ▾" : " ▸")),
+s.uiOpen.fav ? React.createElement("div", null,
 					React.createElement("div", { style: row },
 						React.createElement("button", {
 							onClick: () => {
@@ -881,56 +946,7 @@ window.__ModuleLoader__.load({
 					s.favItems.length ? cardGrid(s.favItems, (it) => play(it.bvid), (it) => it.pic, (it) => fmtDuration(it.duration) + (it.up ? " · " + it.up : "")) : null,
 
 					// ---- 显示/循环选项 ----
-					React.createElement("div", { style: sectionTitle }, "显示与循环"),
-					React.createElement("div", { style: row },
-						React.createElement("span", { style: labelStyle }, "背景透明度"),
-						React.createElement("input", {
-							type: "range", min: 0, max: 100, value: Math.round(s.opacity * 100),
-							onChange: (e) => setState({ opacity: Number(e.target.value) / 100 }), style: { flex: 1 },
-						}),
-						React.createElement("span", { style: { color: "var(--dsw-alias-label-secondary)", fontSize: 12, width: 44, textAlign: "right" } }, Math.round(s.opacity * 100) + "%")
-					),
-					React.createElement("div", { style: row },
-						React.createElement("span", { style: labelStyle }, "背景亮度"),
-						React.createElement("input", {
-							type: "range", min: 50, max: 200, step: 5, value: Math.round(s.brightness * 100),
-							onChange: (e) => setState({ brightness: Number(e.target.value) / 100 }), style: { flex: 1 },
-						}),
-						React.createElement("span", { style: { color: "var(--dsw-alias-label-secondary)", fontSize: 12, width: 44, textAlign: "right" } }, Math.round(s.brightness * 100) + "%")
-					),
-					React.createElement("div", { style: row },
-						React.createElement("span", { style: labelStyle }, "毛玻璃强度"),
-						React.createElement("input", {
-							type: "range", min: 0, max: 30, step: 1, value: s.blur,
-							onChange: (e) => setState({ blur: Number(e.target.value) }), style: { flex: 1 },
-						}),
-						React.createElement("span", { style: { color: "var(--dsw-alias-label-secondary)", fontSize: 12, width: 44, textAlign: "right" } }, s.blur + "px")
-					),
-					React.createElement("label", { style: row },
-						React.createElement("input", {
-							type: "checkbox", checked: s.loop,
-							onChange: (e) => {
-								const loop = e.target.checked;
-								setState({ loop });
-								if (!loop) { clearLoopAll(); setState({ loopInfo: "" }); }
-								else if (state.playing && state.src) play(state.draft);
-							},
-						}),
-						React.createElement("span", { style: labelStyle }, "单曲循环")
-					),
-					s.loopInfo ? React.createElement("div", { style: subStyle }, "循环状态：" + s.loopInfo) : null,
-
-					React.createElement("label", { style: row },
-						React.createElement("input", {
-							type: "checkbox", checked: s.mute,
-							onChange: (e) => {
-								const mute = e.target.checked;
-								setState({ mute });
-								if (state.playing && state.src) play(state.draft);
-							},
-						}),
-						React.createElement("span", { style: labelStyle }, "静音播放（B站VOD静音时无声卡信号，不循环）")
-					),
+) : null,
 					s.error ? React.createElement("div", { style: { color: "var(--dsw-alias-state-error-primary)", fontSize: 12 } }, s.error) : null
 				);
 			}
