@@ -143,7 +143,19 @@ window.__ModuleLoader__.load({
 				const onPause = () => { paused = true; };
 				const onPlay = () => { paused = false; retries = 0; resumeTarget = -1; lastProgressAt = now(); };
 				const onStallEvt = () => { stalledAt = now(); };
-				const onEnd = () => { paused = true; };
+				const onEnd = () => {
+					paused = true;
+					// 截断兜底：没播完（currentTime < duration-1）就收到 ended → 多为代理短读/流提前结束，按 stall 自愈，别直接报错
+					if (disposed || healing) return;
+					const dur = v.duration || 0;
+					const cur = v.currentTime || 0;
+					if (dur > 0 && cur < dur - 1) {
+						if (now() < graceUntil) return;
+						if (retries >= maxRetries) { giveUp("ended"); return; }
+						log("stall-heal ended-truncated current=" + cur.toFixed(2) + " duration=" + dur.toFixed(2));
+						beginHeal("ended-truncated");
+					}
+				};
 				handlers = { onT, onP, onPause, onPlay, onStallEvt, onEnd };
 				v.addEventListener("timeupdate", onT);
 				v.addEventListener("progress", onP);

@@ -666,15 +666,17 @@ function apply(ctx) {
           const tag = 'tk=' + tk.slice(0, 12) + ' range=' + String(req.headers.range || '-').replace(/\s+/g, '_')
           // 直传 ?url= 走白名单（防 SSRF）；?t= 令牌由 Host 自己签，查表取链无需限制
           const m = target.match(/^https?:\/\/([^/]+)/)
-          if (!target) { alog('/ambient-proxy', tag + ' host=- status=404 reason=no-target'); json(res, { error: 'no-target' }, 404); return }
+          if (!target) { alog('/ambient-proxy', tag + ' host=- status=404 reason=no-target total=?'); json(res, { error: 'no-target' }, 404); return }
           if (!cachedTarget && (!m || !/(^|\.)(bilivideo\.com|bilibili\.com|hdslb\.com)$/i.test(m[1]))) {
-            alog('/ambient-proxy', tag + ' host=- status=403 reason=domain-not-allowed'); json(res, { error: 'domain-not-allowed' }, 403); return
+            alog('/ambient-proxy', tag + ' host=- status=403 reason=domain-not-allowed total=?'); json(res, { error: 'domain-not-allowed' }, 403); return
           }
           const mod = target.startsWith('https:') ? https : http
           const parsed = new URL(target)
           const ms = String(req.headers.range || '').match(/^bytes=(\d+)/)
           const startAt = ms ? Number(ms[1]) || 0 : 0 // 客户端 Range 起点，重连偏移= startAt+written
           let written = 0, expect = 0, status = 0, retries = 0
+          let fileTotal = NaN // 整文件总长：优先 Content-Range 斜杠后，退化用 Content-Length；取不到=NaN(记 ?)
+          const fmtTotal = (t) => (Number.isFinite(t) && t > 0 ? t : '?')
           let up = null, out = null, rt = null, closed = false
           const done = (reason) => {
             if (closed) return
@@ -682,12 +684,15 @@ function apply(ctx) {
             if (rt) clearTimeout(rt)
             try { if (up) up.destroy() } catch (e) {}
             try { if (out) out.destroy() } catch (e) {}
-            alog('/ambient-proxy', tag + ' host=' + parsed.hostname + ' status=' + status + ' reason=' + reason + ' retries=' + retries + ' sent=' + written)
+            alog('/ambient-proxy', tag + ' host=' + parsed.hostname + ' status=' + status + ' reason=' + reason + ' retries=' + retries + ' sent=' + written + ' total=' + fmtTotal(fileTotal))
             try { if (!res.headersSent) res.writeHead(502); res.end() } catch (e) {}
           }
           const retry = (why) => {
             if (closed || rt) return // 单飞闸门：同一时刻只挂一个重连，杜绝双上游同时写 res
-            if (status >= 400 || retries >= 5) return done(why + '+exhausted')
+            if (status >= 400 || retries >= 5) {
+              if (why === 'short-read') alog('/ambient-proxy', tag + ' host=' + parsed.hostname + ' short-read-exhausted sent=' + written + ' total=' + fmtTotal(fileTotal) + ' retries=' + retries)
+              return done(why === 'short-read' ? 'short-read-exhausted' : why + '+exhausted')
+            }
             retries++
             rt = setTimeout(() => { rt = null; if (!closed) open() }, 1000 * 2 ** (retries - 1))
           }
@@ -706,9 +711,27 @@ function apply(ctx) {
               else if (status === 416) return done('end') // 偏移已到文件尾 = 已发完
               else if (status !== 206) return done('no-range:' + status)
               expect = written + (Number(r.headers['content-length']) || 0) // 本轮承诺的发完位置
+              // 解析整文件总长：Content-Range 斜杠后为权威值；取不到才退化用 Content-Length（首轮=整文件，续传轮=已发+剩余）
+              const cr = r.headers['content-range']
+              let crTotal = NaN
+              if (cr) { const mm = /\/\s*(\d+)\s*$/.exec(String(cr)); if (mm) crTotal = Number(mm[1]) }
+              const cl = Number(r.headers['content-length'])
+              if (Number.isFinite(crTotal) && crTotal > 0) fileTotal = crTotal
+              else if (!Number.isFinite(fileTotal) && Number.isFinite(cl) && cl > 0) fileTotal = written + cl
               let eof = false
               r.on('data', (c) => { written += c.length; if (!res.write(c)) r.pause() })
-              r.on('end', () => { eof = true; if (expect && written < expect) retry('short-end'); else done('end') }) // 提前 FIN 也按断流重连
+              r.on('end', () => {
+                eof = true
+                // 短读即故障：整段 Range 请求（如 bytes=0- 整文件）尚未发到 fileTotal，即便本轮 Content-Length 已发完也不能按 end 收口
+                if (Number.isFinite(fileTotal) && fileTotal > 0 && written < fileTotal) {
+                  alog('/ambient-proxy', tag + ' host=' + parsed.hostname + ' short-read sent=' + written + ' total=' + fileTotal)
+                  retry('short-read')
+                } else if (expect && written < expect) {
+                  retry('short-end')
+                } else {
+                  done('end')
+                }
+              }) // 提前 FIN / CDN 提前收尾也按断流重连
               r.on('error', () => retry('up-error'))
               r.on('close', () => { if (!eof) retry('up-close') })
             })
@@ -717,13 +740,13 @@ function apply(ctx) {
           }
           res.on('drain', () => { try { if (up) up.resume() } catch (e) {} })
           res.on('error', () => { done('res-error') }) // 客户端断开竞态下 res 报错只清理不抛
-          alog('/ambient-proxy', tag + ' host=' + parsed.hostname + ' status=- reason=req')
+          alog('/ambient-proxy', tag + ' host=' + parsed.hostname + ' status=- reason=req total=?')
           open()
           // 客户端 abort 清理：浏览器换 src/关页 → 立即销毁上游+取消重连定时器，防 CLOSE-WAIT 孤儿
           req.on('aborted', () => done('aborted'))
           req.on('close', () => { if (!res.writableEnded) done('client-gone') })
         } catch (e) {
-          alog('/ambient-proxy', 'status=500 reason=throw:' + String(e && e.message || e).slice(0, 60).replace(/\s+/g, '_'))
+          alog('/ambient-proxy', 'status=500 reason=throw:' + String(e && e.message || e).slice(0, 60).replace(/\s+/g, '_') + ' total=?')
           try { res.writeHead(500); res.end('proxy-err') } catch (e2) {}
         }
       },
