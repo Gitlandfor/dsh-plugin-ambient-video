@@ -30,6 +30,7 @@ window.__ModuleLoader__.load({
 			const maxRetries = opts.maxRetries || STALL_MAX_RETRIES;
 			const healGraceMs = opts.healGraceMs || STALL_HEAL_GRACE_MS;
 			const getSeg = opts.getSeg || function () { return null; };
+			const onPreviewEnd = opts.onPreviewEnd || function () {};
 			let lastGoodTime = 0;     // 最后良态播放位置（续播点）
 			let lastProgressAt = 0;   // 最近一次确认媒体仍在推进的时刻
 			let resumeTarget = -1;    // 本次自愈要续播的位置（恢复并越过它才重置重试计数）
@@ -180,7 +181,12 @@ window.__ModuleLoader__.load({
 					}
 					// 本段正常播完：多段合集现铸下一段续播（不设错误文字、不动自愈预算），单段视频照旧静默结束
 					const plan = segPlan();
-					if (!plan) return;
+					if (!plan) {
+						// 预览桩（只有一段且 preview）：停住并标注，不假装从头循环续播
+						const sg = getSeg();
+						if (sg && sg.preview) { log("preview-end 单段预览播完，不循环"); try { onPreviewEnd(); } catch (e) {} }
+						return;
+					}
 					if (now() < graceUntil) return; // 刚换过源还在宽限窗口，别连环切段
 					log("stall-heal " + (plan.wrap ? "seg-loop" : "seg-advance") + " i=" + plan.next + " segCount=" + plan.count);
 					pendingSeg = plan.next;
@@ -239,8 +245,9 @@ window.__ModuleLoader__.load({
 						if (!el || getDisposed()) { finish(); return; }
 						if (Number.isFinite(Number(r.segIndex))) ctx.segIndex = Math.floor(Number(r.segIndex));
 						if (Number.isFinite(Number(r.segCount))) ctx.segCount = Math.floor(Number(r.segCount));
+						ctx.preview = !!r.preview;	// 自愈重铸时同步 preview（B2 的停住判据跟着最新一次取流结果）
 						const src2 = r.tk ? "/ambient-proxy?t=" + r.tk : "/ambient-proxy?url=" + encodeURIComponent(r.url);
-						log("new tk minted, src=" + src2.slice(0, 40) + "… seg=" + (r.segIndex || 0) + "/" + (r.segCount || 1) + " resume pos=" + pos.toFixed(2));
+						log("new tk minted, src=" + src2.slice(0, 40) + "… seg=" + (r.segIndex || 0) + "/" + (r.segCount || 1) + " preview=" + (r.preview ? 1 : 0) + " resume pos=" + pos.toFixed(2));
 						// 换源前先暂停+强制静音：autoPlay 在 load() 后会从 0 起播，先把这个窗口压成无声
 						const wasMuted = el.muted;
 						try { el.pause(); } catch (e) {}
@@ -334,6 +341,10 @@ window.__ModuleLoader__.load({
 						method: "POST",
 						headers: { "Content-Type": "application/json" },
 						body: JSON.stringify({ proxy: state.proxy || "", localRoot: state.localRoot || "", cookie: state.cookie || "", cookieSource: state.cookieSource || "", aiEnabled: !!state.aiEnabled, aiBase: state.aiBase || "", aiModel: state.aiModel || "", aiKey: state.aiKey || "", aiCount: Number(state.aiCount) || 3, mCount: Number(state.mCount) || 3, searchMode: state.searchMode || "", reasonEnabled: !!state.reasonEnabled, reasonBase: state.reasonBase || "", reasonModel: state.reasonModel || "", reasonKey: state.reasonKey || "" }),
+					}).then((r) => r.json()).then((r) => {
+						// 顺带取回 Host 侧 cookie 状态（只读：来源/上次读取时间/长度区间，Host 从不回传 cookie 值）
+						if (!r || !r.ok) return;
+						setState({ hostCookieSource: String(r.cookieSource || ""), hostCookieAt: Number(r.cookieAt) || 0, hostCookieSet: !!r.cookieSet, hostCookieLen: String(r.cookieLen || "0") });
 					}).catch(() => {});
 				} catch (e) { /* ignore */ }
 			}
@@ -348,6 +359,8 @@ window.__ModuleLoader__.load({
 				uiOpen: { play: true, display: true, local: false, live: false, jf: false, ai: false, fav: false, sm: true },
 				reasonEnabled: true, reasonBase: "", reasonModel: "", reasonKey: "", reasonModels: [], reasonStatus: "",
 				duration: 0, loopInfo: "", error: "",
+				preview: false, streamDur: 0,	// B站取流：是否预览桩 + 实际流长（毫秒）
+				hostCookieSource: "", hostCookieAt: 0, hostCookieSet: false, hostCookieLen: "0",	// Host 侧 cookie 状态（只读，不回传）
 				native: false, nativeLoop: false, liveFormat: "", probe: "",
 				dirPath: "", dirEntries: null, dirError: "",
 				healEvents: [],
@@ -355,7 +368,7 @@ window.__ModuleLoader__.load({
 				jfViews: [], jfItems: [], jfBusy: false, jfItemsInfo: "",
 			}, loadPersisted());
 			// B站VOD 播放上下文：断链自愈重铸 tk 时复用（bvid/page 来源与 playBiliVod 一致）
-			let biliPlayCtx = { bvid: "", page: 1 };
+			let biliPlayCtx = { bvid: "", page: 1, segIndex: 0, segCount: 1, preview: false };
 			// [stall-heal] 日志：console.log 照旧，另记最近 5 条事件（仅内存）供设置面板显示
 			const healLog = (...a) => {
 				console.log("[stall-heal]", ...a);
@@ -494,7 +507,7 @@ window.__ModuleLoader__.load({
 
 			// B站 VOD 原生播放（playurl 直链 + Host 代理转发 + loop 属性循环）
 			function playBiliVod(parsed) {
-				biliPlayCtx = { bvid: parsed.bvid, page: parsed.page || 1, segIndex: 0, segCount: 1 };
+				biliPlayCtx = { bvid: parsed.bvid, page: parsed.page || 1, segIndex: 0, segCount: 1, preview: false };
 				setState({ src: "", site: "bili", native: true, nativeLoop: true, playing: true, nonce: state.nonce + 1, duration: 0, loopInfo: "B站VOD：正在获取直链…", error: "" });
 				fetch("/ambient-playurl?bvid=" + encodeURIComponent(parsed.bvid) + "&page=" + parsed.page).then((r) => r.json()).then((r) => {
 					if (!r || !r.ok) { setState({ playing: false, error: "B站直链获取失败（" + ((r && r.error) || "") + "）：可能被风控，稍后重试" }); return; }
@@ -507,13 +520,22 @@ window.__ModuleLoader__.load({
 					// 改由 ended 分支逐段现铸续播 + 整单循环。segCount<=1 → 完全维持原状
 					const segCount = Math.floor(Number(r.segCount) || 1);
 					const segIndex = Math.floor(Number(r.segIndex) || 0);
+					const isPreview = !!r.preview;
+					const streamDur = Number(r.streamDur) || 0;	// 毫秒
 					biliPlayCtx.segCount = segCount;
 					biliPlayCtx.segIndex = segIndex;
+					biliPlayCtx.preview = isPreview;
 					const multi = segCount > 1;
+					// 预览桩（登录态没生效时 B站只给几分钟试看）：关掉原生 loop，播完停住而不是从头循环
+					const fullTxt = r.duration ? fmtDuration(r.duration) : "?";
+					const tag = isPreview
+						? "（预览 " + (streamDur ? fmtDuration(streamDur / 1000) : "短片") + " / 完整 " + fullTxt + "）"
+						: (streamDur ? "（完整 " + fullTxt + "）" : "");
 					setState({
 						src: r.tk ? "/ambient-proxy?t=" + r.tk : "/ambient-proxy?url=" + encodeURIComponent(r.url),
-						native: true, nativeLoop: !multi, duration: r.duration || 0, pic: r.pic || "",
-						loopInfo: (multi ? "B站VOD（原生480P分段合集 " + (segIndex + 1) + "/" + segCount + "）：" : "B站VOD（原生480P循环）：") + (r.title || parsed.bvid),
+						native: true, nativeLoop: !(multi || isPreview), duration: r.duration || 0, pic: r.pic || "",
+						preview: isPreview, streamDur: streamDur,
+						loopInfo: (multi ? "B站VOD（原生480P分段合集 " + (segIndex + 1) + "/" + segCount + "）：" : "B站VOD（原生480P循环）：") + (r.title || parsed.bvid) + tag,
 						error: "",
 					});
 				}).catch(() => { setState({ playing: false, error: "B站直链接口异常" }); });
@@ -533,7 +555,7 @@ window.__ModuleLoader__.load({
 				if (!parsed) { setState({ playing: false, src: "", error: "请先输入链接/路径" }); return; }
 				clearLoopAll();
 				reasonSeq += 1; // 播放 → 取消在途的逐条理由生成
-				setState({ draft: String(raw || "").trim(), src: "", site: parsed.site, pic: "", playing: true, native: false, nativeLoop: false, liveFormat: "", nonce: state.nonce + 1, duration: 0, probe: "", error: "" });
+				setState({ draft: String(raw || "").trim(), src: "", site: parsed.site, pic: "", playing: true, native: false, nativeLoop: false, liveFormat: "", nonce: state.nonce + 1, duration: 0, probe: "", error: "", preview: false, streamDur: 0 });
 				addHistory({ raw: String(raw || "").trim(), site: parsed.site, bvid: parsed.bvid || "", vid: parsed.vid || "", title: "", pic: "", duration: 0, at: Date.now() });
 				if (parsed.site === "local") { playLocal(parsed.path); return; }
 				if (parsed.site === "live") { playLive(parsed.room); return; }
@@ -627,6 +649,7 @@ window.__ModuleLoader__.load({
 								onStall: (pos, attempt, finish, segOverride) => healBiliVod(pos, attempt, finish, segOverride),
 								getSeg: () => biliPlayCtx,
 								onGiveUp: () => { try { setState({ error: "B站VOD播放中断，多次重铸令牌续播失败（网络或CDN问题），已停止" }); } catch (e) {} },
+							onPreviewEnd: () => { try { const li = String(state.loopInfo || ""); if (li.indexOf("预览结尾") < 0) setState({ loopInfo: li + "｜预览结尾，非完整视频" }); } catch (e) {} },
 								log: healLog,
 							});
 							wd.attach(el);
@@ -1454,6 +1477,15 @@ s.uiOpen.fav ? React.createElement("div", null,
 							style: Object.assign({}, iconBtn, { height: 28, fontSize: 12, padding: "0 10px", borderRadius: 8, border: "0.5px solid var(--dsw-alias-border-l3)", background: "var(--dsw-alias-button-elevated-fill)" }),
 						}, "🌐 从 Chrome 读"),
 						s.cookie ? React.createElement("span", { style: Object.assign({}, subStyle, { paddingLeft: 0 }) }, "Cookie 已就绪（" + (s.cookieSource || "") + "）") : null,
+					),
+					// Host 侧登录态只读状态（syncConfig 的回包带来源/时间，永不含 cookie 值）
+					React.createElement("div", { style: Object.assign({}, subStyle, { paddingLeft: 0, lineHeight: "18px" }) },
+						"登录态：来源 " + (s.hostCookieSet ? (s.hostCookieSource === "chrome" ? "Chrome 自动读取" : s.hostCookieSource === "paste" ? "用户粘贴" : s.hostCookieSource || "未知") : "无") +
+						"（长度 " + (s.hostCookieLen || "0") + "）",
+						React.createElement("br"),
+						"上次读取：" + (s.hostCookieAt ? new Date(s.hostCookieAt).toLocaleString() : "本次运行未自动读取"),
+						React.createElement("br"),
+						"当前视频：" + (s.site === "bili" ? (s.preview ? "预览（登录态未生效，只有试看段）" : "完整") : "非B站VOD"),
 					),
 					React.createElement("div", { style: row },
 						React.createElement("textarea", {

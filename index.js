@@ -390,6 +390,151 @@ function apply(ctx) {
     }
   }
 
+  // ---- Cookie：浏览器读取 + 触发式自动重抽状态 ----
+  // readChromeCookie 只做一件事：从本机 Chrome 解出 SESSDATA 等，返回 {ok, cookie, keyalg, n} 或 {ok:false, reason}。
+  // 任何返回值/日志都不带 cookie 值以外的敏感字段之外的东西：cookie 串只交给调用方写进内存与状态文件。
+  // master key 派生做多候选探测：Windows(DPAPI 前缀 + sha256(peanuts)) 与 Linux(无 DPAPI 前缀 + PBKDF2-SHA1(saltysalt,1))，
+  // 谁的候选能解出至少一条 bilibili cookie 就用谁（keyalg=win|linux）。
+  const CHROME_COOKIE_KEYS = ['SESSDATA', 'bili_jct', 'DedeUserID', 'buvid3']
+  function chromeMasterKeyCandidates(buf) {
+    const blob = buf.subarray(0, 5).toString('latin1') === 'DPAPI' ? buf.subarray(5) : buf
+    const cands = [{ alg: 'win', blob, key: crypto.createHash('sha256').update('peanuts').digest().subarray(0, 16) }]
+    try { cands.push({ alg: 'linux', blob, key: crypto.pbkdf2Sync('peanuts', 'saltysalt', 1, 16, 'sha1') }) } catch (e) { /* 无 pbkdf2 就只剩 win 候选 */ }
+    const seen = new Set()
+    return cands.filter((c) => { const k = c.key.toString('hex'); if (seen.has(k)) return false; seen.add(k); return true })
+  }
+  function chromeCookieDecrypt(masterKey, hex) {
+    try {
+      const v = Buffer.from(hex, 'hex')
+      if (v.length < 19 || v.subarray(0, 3).toString() !== 'v10') return null
+      const nonce = v.subarray(3, 15)
+      const tag = v.subarray(v.length - 16)
+      const ct = v.subarray(15, v.length - 16)
+      for (const kl of [32, 16]) {
+        if (kl > masterKey.length) continue
+        try {
+          const d = crypto.createDecipheriv('aes-' + (kl * 8) + '-gcm', masterKey.subarray(0, kl), nonce)
+          d.setAuthTag(tag)
+          return Buffer.concat([d.update(ct), d.final()]).toString('utf8')
+        } catch (e2) { /* try next length */ }
+      }
+      return null
+    } catch (e) { return null }
+  }
+  async function readChromeCookie() {
+    const base = path.join(os.homedir(), '.config', 'google-chrome')
+    if (!fs.existsSync(base)) return { ok: false, reason: 'no-chrome' }
+    const profile = fs.existsSync(path.join(base, 'Default')) ? 'Default' : (fs.readdirSync(base).find((n) => n.startsWith('Profile ')) || '')
+    const stateP = path.join(base, 'Local State')
+    const dbP = path.join(base, profile || 'Default', 'Cookies')
+    if (!fs.existsSync(stateP) || !fs.existsSync(dbP)) return { ok: false, reason: 'no-chrome-profile' }
+    let enc = ''
+    try { const ls = JSON.parse(fs.readFileSync(stateP, 'utf8')); enc = (ls.os_crypt && ls.os_crypt.encrypted_key) ? ls.os_crypt.encrypted_key : '' } catch (e) { return { ok: false, reason: 'local-state-fail' } }
+    if (!enc) return { ok: false, reason: 'no-key' }
+    const buf = Buffer.from(enc, 'base64')
+    if (!buf.length) return { ok: false, reason: 'no-key' }
+    const tmp = path.join(os.tmpdir(), 'chck-' + Date.now())
+    fs.mkdirSync(tmp)
+    let rows = []
+    try {
+      for (const s of ['Cookies', 'Cookies-wal', 'Cookies-shm']) {
+        const src = path.join(path.dirname(dbP), s)
+        if (fs.existsSync(src)) { try { fs.copyFileSync(src, path.join(tmp, s)) } catch (e) {} }
+      }
+      const py = path.join(tmp, 'dump.py')
+      fs.writeFileSync(py, '\
+import sqlite3, json, sys\n\
+db = sqlite3.connect(sys.argv[1])\n\
+cur = db.cursor()\n\
+out = []\n\
+try:\n\
+  cur.execute("SELECT name, encrypted_value FROM cookies WHERE host_key LIKE \\"%bilibili.com\\" OR host_key LIKE \\"%bili.com\\"")\n\
+  for name, ev in cur.fetchall():\n\
+    if name in ("SESSDATA","bili_jct","DedeUserID","buvid3"): out.append([name, ev.hex()])\n\
+except Exception as e: pass\n\
+db.close()\n\
+print(json.dumps(out))\n')
+      if (!shell) return { ok: false, reason: 'no-shell' }
+      const spec = shell.resolve({ command: 'python3 ' + JSON.stringify(py) + ' ' + JSON.stringify(path.join(tmp, 'Cookies')), timeoutMs: 15000, stdoutMaxBytes: 262144 })
+      const r = await shell.run(spec)
+      try { rows = JSON.parse(r && r.stdout ? (r.stdout.text || '[]') : '[]') } catch (e) { rows = [] }
+    } finally {
+      try { fs.rmSync(tmp, { recursive: true, force: true }) } catch (e) {}
+    }
+    if (!Array.isArray(rows) || !rows.length) return { ok: false, reason: 'no-rows' }
+    const plain = {}
+    let keyalg = ''
+    let triedAny = false
+    for (const c of chromeMasterKeyCandidates(buf)) {
+      let masterKey = null
+      try {
+        const dc = crypto.createDecipheriv('aes-128-cbc', c.key, Buffer.alloc(16, 0x20))
+        dc.setAutoPadding(false)
+        masterKey = Buffer.concat([dc.update(c.blob), dc.final()]).subarray(0, 32)
+      } catch (e) { masterKey = null }
+      if (!masterKey || masterKey.length < 16) continue
+      const ck = {}
+      for (const row of rows) {
+        const val = chromeCookieDecrypt(masterKey, String(row[1] || ''))
+        if (val && CHROME_COOKIE_KEYS.includes(row[0])) ck[row[0]] = val
+      }
+      const n = Object.keys(ck).length
+      if (!n) continue
+      triedAny = true
+      if (!plain.SESSDATA || n > Object.keys(plain).length) { // 解出 SESSDATA 的候选胜出；都没解出则留条目最多的一份，便于诊断
+        Object.keys(plain).forEach((k) => delete plain[k])
+        Object.assign(plain, ck)
+        keyalg = c.alg
+      }
+      if (plain.SESSDATA) break
+    }
+    if (plain.SESSDATA) {
+      const cookie = ['SESSDATA=' + plain.SESSDATA, plain.bili_jct ? 'bili_jct=' + plain.bili_jct : '', plain.DedeUserID ? 'DedeUserID=' + plain.DedeUserID : ''].filter(Boolean).join('; ')
+      return { ok: true, cookie, keyalg, n: Object.keys(plain).length, has: Object.keys(plain).join(',') }
+    }
+    // 解不出来时区分原因：v11 = GNOME Keyring 保护（本方案的 peanuts 主密钥帮不上忙），
+    // key-fail = 两套候选都解不开任何条目，no-sessdata = 能解但里面没有 SESSDATA
+    const prefixes = new Set(rows.map((x) => { try { const p = Buffer.from(String(x[1] || ''), 'hex').subarray(0, 3).toString(); return p === 'v11' ? 'v11' : p } catch (e) { return '' } }))
+    const reason = prefixes.has('v11') ? 'v11-keyring' : (triedAny ? 'no-sessdata' : 'key-fail')
+    return { ok: false, reason, n: Object.keys(plain).length }
+  }
+
+  // 内存 cookie 的 TTL 与失败冷却：读失败后 15 分钟内所有铸 tk 一律跳过读取（别每次翻浏览器库）
+  const COOKIE_TTL_MS = 6 * 3600 * 1000
+  const COOKIE_FAIL_COOLDOWN_MS = 15 * 60 * 1000
+  const AUTH_RETRY_CODES = [-101, -412, -403]   // 未登录 / 风控 / 无权限：值得重读 cookie 再试一次
+  let authSince = Number(st0.cookieAt) || 0
+  let cookieAt = authSince
+  let cookieFailAt = 0
+  // 应用一次成功的读取：内存 + 落盘（cookieAt 供设置面板显示）
+  function applyReadCookie(r, source) {
+    biliCookieStr = r.cookie
+    cookieSource = source
+    authSince = Date.now()
+    cookieAt = authSince
+    cookieFailAt = 0
+    saveState({ cookie: r.cookie, cookieSource: source, cookieAt: authSince })
+  }
+  // 铸 tk 前的自动读取。force=绕过内存 TTL（preview/风控码重抽时），但冷却期一律跳过。
+  // 用户手动粘贴过（cookieSource=paste）时优先级最高：自动读取不改写它，只有 chrome 或空才允许改写。
+  async function ensureCookieAuto(force) {
+    if (cookieSource === 'paste' && biliCookieStr) return !!biliCookieStr
+    if (biliCookieStr && authSince && Date.now() - authSince < COOKIE_TTL_MS && !(force && cookieSource === 'chrome')) return true
+    if (Date.now() - cookieFailAt < COOKIE_FAIL_COOLDOWN_MS) {
+      alog('/ambient-playurl', 'cookie-read-skip cooldown=' + Math.ceil((COOKIE_FAIL_COOLDOWN_MS - (Date.now() - cookieFailAt)) / 1000) + 's')
+      return !!biliCookieStr
+    }
+    const r = await readChromeCookie()
+    if (!r.ok) {
+      cookieFailAt = Date.now()
+      alog('/ambient-playurl', 'cookie-read-fail reason=' + r.reason + (r.n ? ' n=' + r.n : ''))
+      return !!biliCookieStr
+    }
+    applyReadCookie(r, 'chrome')
+    alog('/ambient-playurl', 'cookie-read source=chrome keyalg=' + r.keyalg + ' n=' + r.n + ' at=' + new Date(authSince).toISOString())
+    return true
+  }
+
   if (webServer) {
     // ---- 配置同步 POST：proxy / localRoot / cookie / cookieSource ----
     const offCfg = webServer.register({
@@ -409,8 +554,14 @@ function apply(ctx) {
               if (real && fs.existsSync(real) && fs.statSync(real).isDirectory()) localRoot = real
             }
             if (typeof p.cookie === 'string') {
-              biliCookieStr = p.cookie.replace(/[\r\n"]/g, '').trim()
-              cookieSource = typeof p.cookieSource === 'string' ? p.cookieSource : 'paste'
+              const c = p.cookie.replace(/[\r\n"]/g, '').trim()
+              // 客户端推空串不清掉 Host 已有的 cookie（与 saveState 同规则）：否则页面一刷新
+              // 就把自动读到的登录态擦干净，每次都退回匿名取流
+              if (c) {
+                biliCookieStr = c
+                cookieSource = typeof p.cookieSource === 'string' && p.cookieSource.trim() ? p.cookieSource.trim() : 'paste'
+                if (cookieSource === 'paste') authSince = Date.now()
+              }
             }
             if (typeof p.aiEnabled === 'boolean') aiEnabled = p.aiEnabled
             if (typeof p.aiProvider === 'string' && p.aiProvider.trim()) aiProvider = p.aiProvider.trim()
@@ -429,7 +580,7 @@ function apply(ctx) {
             if (typeof p.reasonModel === 'string') reasonModel = p.reasonModel.trim()
             if (typeof p.reasonKey === 'string') reasonKey = p.reasonKey.trim()
             saveState({ cookie: biliCookieStr, cookieSource, aiEnabled, aiProvider, aiBase, aiModel, aiKey, aiCount, mCount, searchMode, reasonEnabled, reasonProvider, reasonBase, reasonModel, reasonKey, proxy: searchProxy, localRoot })
-            json(res, { ok: true, proxy: searchProxy, localRoot, cookieSet: !!biliCookieStr, cookieSource, aiEnabled, aiProvider, aiBase, aiModel, aiSet: !!aiModel, aiCount, mCount, searchMode, reasonEnabled, reasonProvider, reasonBase, reasonModel })
+            json(res, { ok: true, proxy: searchProxy, localRoot, cookieSet: !!biliCookieStr, cookieSource, cookieAt, cookieLen: biliCookieStr ? (biliCookieStr.length < 100 ? '<100' : biliCookieStr.length < 200 ? '100-200' : biliCookieStr.length < 400 ? '200-400' : '>=400') : '0', aiEnabled, aiProvider, aiBase, aiModel, aiSet: !!aiModel, aiCount, mCount, searchMode, reasonEnabled, reasonProvider, reasonBase, reasonModel })
           } catch (e) {
             json(res, { ok: false }, 500)
           }
@@ -587,7 +738,7 @@ function apply(ctx) {
     ctx.effect(() => offLocal)
 
     // ---- B站 VOD 直链解析 ?bvid= &page= [&seg=] → {url: durl mp4 直链, duration, title, segIndex, segCount}（fnval=1 老式 durl，480P 匿名可拿）----
-    let playurlCache = { at: 0, key: '', url: '', segs: [], duration: 0, title: '' }
+    let playurlCache = { at: 0, key: '', url: '', segs: [], duration: 0, title: '', streamDur: 0, preview: false, auth: 'anon' }
     // 播放令牌：直链由 /ambient-playurl 铸造，浏览器只拿 token 不拿 URL
     // （原 ?url= 白名单只含 bilivideo/bilibili/hdslb，B站第三方 CDN 如 mountaintoys.cn 会被 403；
     //  且客户端传 URL 有 SSRF 面。token 由 Host 自己签，代理查表取链，天然安全且不限 CDN）
@@ -609,48 +760,84 @@ function apply(ctx) {
           if (playurlCache.key === key && Date.now() - playurlCache.at < 15000 && Array.isArray(playurlCache.segs) && seg < playurlCache.segs.length) {
             const segs = playurlCache.segs
             const tk = mint(segs[seg])
-            alog('/ambient-playurl', 'tk=' + tk.slice(0, 12) + ' bvid=' + bvid + ' seg=' + seg + ' status=200 reason=ok cached=1 segCount=' + segs.length)
-            json(res, { ok: true, url: segs[seg], tk, duration: playurlCache.duration, title: playurlCache.title, pic: playurlCache.pic || '', cached: true, segIndex: seg, segCount: segs.length })
+            alog('/ambient-playurl', 'tk=' + tk.slice(0, 12) + ' bvid=' + bvid + ' seg=' + seg + ' status=200 reason=ok cached=1 segCount=' + segs.length + ' auth=' + (playurlCache.auth || 'anon') + ' streamDur=' + (playurlCache.streamDur || 0) + ' preview=' + (playurlCache.preview ? 1 : 0))
+            json(res, { ok: true, url: segs[seg], tk, duration: playurlCache.duration, title: playurlCache.title, pic: playurlCache.pic || '', cached: true, segIndex: seg, segCount: segs.length, preview: !!playurlCache.preview, streamDur: playurlCache.streamDur || 0 })
             return
           }
           // 完整浏览器特征头：B站 WAF 对裸请求会 429（与 search/fav 侧同款铁律）
-          const biliHdr = {
-            'User-Agent': UA,
-            Referer: 'https://www.bilibili.com/',
-            'sec-ch-ua': '"Chromium";v="126", "Google Chrome";v="126", "Not.A/Brand";v="24"',
-            'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"Linux"',
-            'sec-fetch-site': 'same-site',
-            'sec-fetch-mode': 'cors',
-            'sec-fetch-dest': 'empty',
-            'sec-fetch-user': '?1',
-            'sec-fetch-platform': '"Linux"',
-            Accept: 'application/json, text/plain, */*',
+          // 取流带登录态：biliCookieStr 非空时给 view/playurl 两条请求加 Cookie 头（每次现建，
+          // 因为自动读取可能在两次尝试之间改写它）。/ambient-proxy 的上游头与此无关，CDN 直链不加 cookie。
+          const biliHdr = () => {
+            const h = {
+              'User-Agent': UA,
+              Referer: 'https://www.bilibili.com/',
+              'sec-ch-ua': '"Chromium";v="126", "Google Chrome";v="126", "Not.A/Brand";v="24"',
+              'sec-ch-ua-mobile': '?0',
+              'sec-ch-ua-platform': '"Linux"',
+              'sec-fetch-site': 'same-site',
+              'sec-fetch-mode': 'cors',
+              'sec-fetch-dest': 'empty',
+              'sec-fetch-user': '?1',
+              'sec-fetch-platform': '"Linux"',
+              Accept: 'application/json, text/plain, */*',
+            }
+            if (biliCookieStr) h.Cookie = biliCookieStr
+            return h
           }
           // view API 拿 cid：直连 https 流式读满（web.fetch 会 100000 字符截断，见 httpsGetText 注释）
           const viewUrl = 'https://api.bilibili.com/x/web-interface/view?bvid=' + encodeURIComponent(bvid)
-          const vd = parseBili('view', await httpsGetText(viewUrl, biliHdr))
-          if (!vd || vd.code !== 0 || !vd.data) { fail('view-api:' + String(vd && vd.code)); return }
-          let cid = Number(vd.data.cid) || 0
-          if (page > 1 && Array.isArray(vd.data.pages)) {
-            const pg = vd.data.pages.find((x) => Number(x.page) === page)
-            if (pg && Number(pg.cid)) cid = Number(pg.cid)
+          // playurl API fnval=1 拿 durl mp4 直链；qn=16 保持不变（带不带 cookie 都走这条老式链）
+          const playurlOf = (cid) => 'https://api.bilibili.com/x/player/playurl?bvid=' + encodeURIComponent(bvid) + '&cid=' + cid + '&qn=16&fnval=1&fnver=0'
+          // 一次完整取流：view → playurl。streamDur = durl 各条 duration 求和，无 duration 时退化用顶层 timelength；
+          // 这两项 B站侧通常是毫秒而 view 的 duration 是秒，故按秒数比值归一（raw < duration*8 判成秒 → ×1000），对外一律毫秒。
+          const attempt = async () => {
+            const hdr = biliHdr()
+            const vd = parseBili('view', await httpsGetText(viewUrl, hdr))
+            if (!vd || vd.code !== 0 || !vd.data) return { fail: 'view-api:' + String(vd && vd.code) }
+            let cid = Number(vd.data.cid) || 0
+            if (page > 1 && Array.isArray(vd.data.pages)) {
+              const pg = vd.data.pages.find((x) => Number(x.page) === page)
+              if (pg && Number(pg.cid)) cid = Number(pg.cid)
+            }
+            if (!cid) return { fail: 'no-cid' }
+            const pd = parseBili('playurl', await httpsGetText(playurlOf(cid), hdr))
+            if (!pd || pd.code !== 0 || !pd.data) return { fail: 'playurl-api:' + String(pd && pd.code), pcode: Number(pd && pd.code) }
+            if (!Array.isArray(pd.data.durl) || !pd.data.durl.length) return { fail: 'no-durl' }
+            // 多段 durl：B站把超长合集（如 50 首精选，3h42m）切成若干 mp4 段，只播 durl[0] 会在
+            // 第 1 段播完时静默结束。这里整表缓存，seg 由客户端播到下一段时现铸（CDN 直链有时效，预铸会囤过期链）
+            const segs = pd.data.durl.map((d) => String((d && d.url) || '')).filter(Boolean)
+            if (!segs.length) return { fail: 'no-durl' }
+            const duration = Number(vd.data.duration) || 0
+            let rawDur = 0
+            for (const d of pd.data.durl) rawDur += Number(d && d.duration) || 0
+            const srcDur = rawDur > 0 ? rawDur : (Number(pd.data.timelength) || 0)
+            const streamDur = srcDur > 0 && duration > 0 && srcDur < duration * 8 ? srcDur * 1000 : srcDur
+            const preview = !!(duration > 0 && streamDur > 0 && streamDur < duration * 1000 * 0.6)
+            return { segs, duration, streamDur, preview, title: String(vd.data.title || ''), pic: String(vd.data.pic || ''), auth: biliCookieStr ? 'cookie' : 'anon' }
           }
-          if (!cid) { fail('no-cid'); return }
-          // playurl API fnval=1 拿 durl mp4 直链；qn=16 匿名即可（头与参数与原 curl 路径一致）
-          const puUrl = 'https://api.bilibili.com/x/player/playurl?bvid=' + encodeURIComponent(bvid) + '&cid=' + cid + '&qn=16&fnval=1&fnver=0'
-          const pd = parseBili('playurl', await httpsGetText(puUrl, biliHdr))
-          if (!pd || pd.code !== 0 || !pd.data || !pd.data.durl || !pd.data.durl.length) { fail('playurl-api:' + String(pd && pd.code)); return }
-          // 多段 durl：B站把超长合集（如 50 首精选，3h42m）切成若干 mp4 段，只播 durl[0] 会在
-          // 第 1 段播完时静默结束。这里整表缓存，seg 由客户端播到下一段时现铸（CDN 直链有时效，预铸会囤过期链）
-          const segs = pd.data.durl.map((d) => String((d && d.url) || '')).filter(Boolean)
-          if (!segs.length) { fail('no-durl'); return }
-          const idx = seg < segs.length ? seg : 0
-          const url = segs[idx]
-          playurlCache = { at: Date.now(), key, url: segs[0], segs, duration: Number(vd.data.duration) || 0, title: String(vd.data.title || ''), pic: String(vd.data.pic || '') }
+          // 强制重读浏览器 cookie（绕过内存 TTL）。粘贴来源不参与：用户手动粘的优先级最高，
+          // 自动读取只允许改写 cookieSource 为 chrome 或空的情况。只在真的换到不同 cookie 时才重试取流。
+          const rereadCookie = async () => {
+            if (cookieSource === 'paste' && biliCookieStr) return false
+            const before = biliCookieStr
+            await ensureCookieAuto(true)
+            return !!biliCookieStr && biliCookieStr !== before
+          }
+          await ensureCookieAuto(false)     // 无 cookie 先自动读一次 chrome；读不到就匿名铸
+          let out = await attempt()
+          if (out.pcode && AUTH_RETRY_CODES.includes(out.pcode)) {   // 登录态失效/风控 → 重读一次再试
+            if (await rereadCookie()) out = await attempt()
+          }
+          if (!out.fail && out.preview) {                            // 预览桩 → 重读 cookie 再试一次，仍预览就照实返回
+            if (await rereadCookie()) { const again = await attempt(); if (!again.fail) out = again }
+          }
+          if (out.fail) { fail(out.fail); return }
+          const idx = seg < out.segs.length ? seg : 0
+          const url = out.segs[idx]
+          playurlCache = { at: Date.now(), key, url: out.segs[0], segs: out.segs, duration: out.duration, title: out.title, pic: out.pic, streamDur: out.streamDur, preview: out.preview, auth: out.auth }
           const tk = mint(url)
-          alog('/ambient-playurl', 'tk=' + tk.slice(0, 12) + ' bvid=' + bvid + ' seg=' + idx + ' status=200 reason=ok segCount=' + segs.length)
-          json(res, { ok: true, url, tk, duration: playurlCache.duration, title: playurlCache.title, pic: playurlCache.pic, segIndex: idx, segCount: segs.length })
+          alog('/ambient-playurl', 'tk=' + tk.slice(0, 12) + ' bvid=' + bvid + ' seg=' + idx + ' status=200 reason=ok segCount=' + out.segs.length + ' auth=' + out.auth + ' streamDur=' + out.streamDur + ' preview=' + (out.preview ? 1 : 0))
+          json(res, { ok: true, url, tk, duration: playurlCache.duration, title: playurlCache.title, pic: playurlCache.pic, segIndex: idx, segCount: out.segs.length, preview: !!out.preview, streamDur: out.streamDur })
         } catch (e) { alog('/ambient-playurl', 'status=500 reason=playurl-fail:' + String(e && e.message || e).slice(0, 60)); json(res, { ok: false, error: 'playurl-fail' }) }
       },
     })
@@ -1127,77 +1314,13 @@ print(json.dumps(out))\n')
             cookieSource = 'firefox'
             json(res, { ok: true, cookie, source: 'firefox', has: Object.keys(ck).join(',') })
           } else if (browser === 'chrome') {
-            const base = path.join(os.homedir(), '.config', 'google-chrome')
-            if (!fs.existsSync(base)) { json(res, { ok: false, error: 'no-chrome' }); return }
-            const profile = fs.existsSync(path.join(base, 'Default')) ? 'Default' : (fs.readdirSync(base).find((n) => n.startsWith('Profile ')) || '')
-            const stateP = path.join(base, 'Local State')
-            const dbP = path.join(base, profile, 'Cookies')
-            if (!fs.existsSync(stateP) || !fs.existsSync(dbP)) { json(res, { ok: false, error: 'no-chrome-profile' }); return }
-            const ls = JSON.parse(fs.readFileSync(stateP, 'utf8'))
-            const enc = (ls.os_crypt && ls.os_crypt.encrypted_key) ? ls.os_crypt.encrypted_key : ''
-            if (!enc) { json(res, { ok: false, error: 'no-key' }); return }
-            const buf = Buffer.from(enc, 'base64')
-            const blob = buf.subarray(5) // 去 'DPAPI'
-            let masterKey = null
-            try {
-              const iv = Buffer.alloc(16, 0x20)
-              const dc = crypto.createDecipheriv('aes-128-cbc', crypto.createHash('sha256').update('peanuts').digest().subarray(0, 16), iv)
-              dc.setAutoPadding(false)
-              masterKey = Buffer.concat([dc.update(blob), dc.final()])
-            } catch (e) { masterKey = null }
-            if (!masterKey) { json(res, { ok: false, error: 'key-fail' }); return }
-            const tmp = path.join(os.tmpdir(), 'chck-' + Date.now())
-            fs.mkdirSync(tmp)
-            for (const s of ['Cookies', 'Cookies-wal', 'Cookies-shm']) {
-              const src = path.join(path.dirname(dbP), s)
-              if (fs.existsSync(src)) { try { fs.copyFileSync(src, path.join(tmp, s)) } catch (e) {} }
-            }
-            const py = path.join(tmp, 'dump.py')
-            fs.writeFileSync(py, '\
-import sqlite3, json, sys\n\
-db = sqlite3.connect(sys.argv[1])\n\
-cur = db.cursor()\n\
-out = []\n\
-try:\n\
-  cur.execute("SELECT name, encrypted_value FROM cookies WHERE host_key LIKE \\"%bilibili.com\\" OR host_key LIKE \\"%bili.com\\"")\n\
-  for name, ev in cur.fetchall():\n\
-    if name in ("SESSDATA","bili_jct","DedeUserID","buvid3"): out.append([name, ev.hex()])\n\
-except Exception as e: pass\n\
-db.close()\n\
-print(json.dumps(out))\n')
-            const spec = shell.resolve({ command: 'python3 ' + JSON.stringify(py) + ' ' + JSON.stringify(path.join(tmp, 'Cookies')), timeoutMs: 15000, stdoutMaxBytes: 262144 })
-            const r = await shell.run(spec)
-            let rows = []
-            try { rows = JSON.parse(r && r.stdout ? (r.stdout.text || '[]') : '[]') } catch (e) { rows = [] }
-            try { fs.rmSync(tmp, { recursive: true, force: true }) } catch (e) {}
-            const decryptVal = (hex) => {
-              try {
-                const v = Buffer.from(hex, 'hex')
-                if (v.subarray(0, 3).toString() !== 'v10') return null
-                const nonce = v.subarray(3, 15)
-                const tag = v.subarray(v.length - 16)
-                const ct = v.subarray(15, v.length - 16)
-                for (const kl of [32, 16]) {
-                  try {
-                    const d = crypto.createDecipheriv('aes-' + (kl * 8) + '-gcm', masterKey.subarray(0, kl), nonce)
-                    d.setAuthTag(tag)
-                    const pt = Buffer.concat([d.update(ct), d.final()])
-                    return pt.toString('utf8')
-                  } catch (e2) { /* try next length */ }
-                }
-                return null
-              } catch (e) { return null }
-            }
-            const ck = {}
-            for (const [name, hex] of rows) {
-              const val = decryptVal(hex)
-              if (val) ck[name] = val
-            }
-            if (!ck.SESSDATA) { json(res, { ok: false, error: 'no-sessdata', hint: 'Chrome v20 新加密可能读不了，建议在设置里直接粘贴 Cookie' }); return }
-            const cookie = ['SESSDATA=' + ck.SESSDATA, ck.bili_jct ? 'bili_jct=' + ck.bili_jct : '', ck.DedeUserID ? 'DedeUserID=' + ck.DedeUserID : ''].filter(Boolean).join('; ')
-            biliCookieStr = cookie
-            cookieSource = 'chrome'
-            json(res, { ok: true, cookie, source: 'chrome', has: Object.keys(ck).join(',') })
+            // 实现与自动读取共用 readChromeCookie（含 Linux/Windows master key 多候选探测）。
+            // 这里是用户点按钮显式触发的读取，允许覆盖粘贴来源；自动路径才遵守 paste 优先。
+            const r = await readChromeCookie()
+            if (!r.ok) { json(res, { ok: false, error: r.reason, n: r.n || 0, hint: r.reason === 'v11-keyring' ? 'Chrome 用 GNOME Keyring(v11) 加密，本插件解不了，请在设置里直接粘贴 Cookie' : 'Chrome 里没有可用的 bilibili 登录 Cookie，建议在设置里直接粘贴' }); return }
+            applyReadCookie(r, 'chrome')
+            alog('/ambient-cookie/read', 'cookie-read source=chrome keyalg=' + r.keyalg + ' n=' + r.n + ' at=' + new Date(cookieAt).toISOString())
+            json(res, { ok: true, cookie: r.cookie, source: 'chrome', keyalg: r.keyalg, n: r.n, has: r.has })
           } else {
             json(res, { ok: false, error: 'bad-browser' })
           }
