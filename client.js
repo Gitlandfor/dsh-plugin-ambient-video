@@ -457,7 +457,9 @@ window.__ModuleLoader__.load({
 					};
 					const id = setInterval(tick, 1500);
 					tick();
-					return () => { alive = false; clearInterval(id); if (unsub.current) unsub.current(); };
+					// 卸载时清掉全局卡片：模块级 OV 不随组件销毁，不清的话重新挂载时
+					// useState(OV.cards) 会读到上次的旧卡片，浮层又"自己跳出来"
+					return () => { alive = false; clearInterval(id); if (unsub.current) unsub.current(); clearOverlay(); };
 				}, []);
 				React.useEffect(() => {
 					if (!cards || !cards.length) return undefined;
@@ -522,20 +524,28 @@ window.__ModuleLoader__.load({
 				const label = "\U0001F0CF " + (queryText || "AI 推荐");
 				const [reasons, setReasons] = React.useState({});
 				const [phase, setPhase] = React.useState(!outcome ? "exec" : outcome.kind !== "success" ? "err" : (cards && cards.length ? "cards" : "none"));
+				// 只认"本页亲眼见过执行中（outcome === null）"的本次命令：刷新页面 / 切会话回放 /
+				// 滚动导致的重挂载，看到的 outcome 一律已就绪，sawExec 保持 false → 不弹浮层也不自动播放
+				const [sawExec, setSawExec] = React.useState(false);
 				const firedKey = React.useRef("");
 				const merged = cards && cards.length ? cards.map((c, i) => (reasons[i] ? Object.assign({}, c, { reason: reasons[i] }) : c)) : null;
 		// 展示文本一律剥掉 CARDS: 后的 base64 载荷（那串就是用户看到的"乱码"）
 		const displayText = text.indexOf("CARDS:") >= 0 ? text.slice(0, text.indexOf("CARDS:")).trim() : text;
 				// 新命令结果到来时清空上一批理由
 				React.useEffect(() => { setReasons({}); }, [text]);
-				// 合并后的卡片同步到顶层浮层（主动弹出通道）
+				// 先给"这是本页新跑的命令"打标（旧结果的回放永远不会经过 outcome === null）
 				React.useEffect(() => {
-					if (merged && merged.length) setOverlayCards(merged, label);
-				}, [text, reasons]);
+					if (node && node.outcome === null) setSawExec(true);
+				}, [node]);
+				// 合并后的卡片同步到顶层浮层（主动弹出通道）：sawExec 为假 = 历史回放，不弹
+				React.useEffect(() => {
+					if (merged && merged.length && sawExec) setOverlayCards(merged, label);
+				}, [text, reasons, sawExec]);
 				React.useEffect(() => {
 					if (!outcome) { setPhase("exec"); return; }
 					if (outcome.kind !== "success") { setPhase("err"); return; }
 					setPhase(merged && merged.length ? "cards" : "none");
+					if (!sawExec) return;   // 历史回放：不补理由、不自动播放
 					if (firedKey.current !== text && cards && cards.length) {
 						firedKey.current = text;
 						startReasons(cards, label);
@@ -543,7 +553,7 @@ window.__ModuleLoader__.load({
 						const b = text.match(/BV[0-9A-Za-z]{10,}/);
 						if (b) { autoPlaySeen.add(text); play(b[0]); }
 					}
-				}, [outcome]);
+				}, [outcome, sawExec]);
 				// 逐条异步补推荐理由（间隔 ~400ms 模拟流式；播放后 reasonSeq 变化即停止）
 				const startReasons = (list, srcLabel) => {
 					const mine = ++reasonSeq;
@@ -580,16 +590,19 @@ window.__ModuleLoader__.load({
 			function PlayHistoryRow(props) {
 				const node = props && props.node;
 				const [cards, setCards] = React.useState(null);
+				const [sawExec, setSawExec] = React.useState(false);
 				const fired = React.useRef(false);
 				React.useEffect(() => {
-					if (!node || fired.current) return;
-					if (node.outcome === null) return;
+					if (!node) return;
+					if (node.outcome === null) { setSawExec(true); return; }
+					if (fired.current) return;
 					fired.current = true;
 					if (node.outcome.kind !== "success") return;
 					const h = getHistory();
 					setCards(h);
-					if (h && h.length) setOverlayCards(h, "🕘 播放历史");
-				}, [node]);
+					// 只有本页新跑的 /playhistory 才自动弹浮层；刷新 / 回放 / 重挂载不弹
+					if (sawExec && h && h.length) setOverlayCards(h, "🕘 播放历史");
+				}, [node, sawExec]);
 				const header = !node ? "" : node.outcome === null ? "⏳ 读取历史…" : (cards && cards.length ? "🕘 共 " + cards.length + " 条，卡片浮层已展开" : "暂无播放历史，先播放几个视频吧");
 				return React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 8, padding: "4px 0" } },
 					React.createElement("div", { style: { fontSize: 12, color: "var(--dsw-alias-label-secondary)", fontFamily: "var(--ds-font-family-code, monospace)", overflowWrap: "anywhere" } }, "/playhistory"),
