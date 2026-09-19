@@ -760,15 +760,74 @@ window.__ModuleLoader__.load({
 				return () => OV.listeners.delete(fn);
 			}
 			// 单张炉石风卡牌（按时长定稀有度：>50min 传说橙 / >30min 史诗紫 / >15min 稀有蓝 / 其余普通白）
-			// 只能拖拽，点击无效
-			function HsCardEl(c, i) {
+			// 按住卡片拖动：位移欧氏距离 > DRAG_PLAY_PX 松手即播，未达阈值回弹（原 HTML5 拖拽链路已移除）
+			const DRAG_PLAY_PX = 60;
+			let suppressClickUntil = 0;   // 拖拽结束后短窗口内吞掉冒泡到根节点的 click，防误关浮层
+			function HsCardEl(c, i, onZone) {
 				const x = Number(c.duration) || 0;
 				const rarity = x > 3000 ? "#ff8000" : x > 1800 ? "#a335ee" : x > 900 ? "#3d6ad6" : "#9a9a9a";
+				const payload = c.raw || c.bvid || c.url || "";
+				// 拖拽态挂在 DOM 元素上：浮层 1.5s 轮询 / 投放区高亮切换会重建卡片闭包与新 handler，存闭包会丢
+				// 拖拽视觉用 body 级克隆跟随指针：手牌条是 overflow 滚动容器会裁切溢出，克隆逃逸裁切与 backdrop-filter
+				function onDown(e) {
+					if (e.button != null && e.button !== 0) return;
+					const t = e.currentTarget;
+					const r = t.getBoundingClientRect();
+					const g = t.cloneNode(true);
+					g.style.position = "fixed";
+					g.style.left = r.left + "px";
+					g.style.top = r.top + "px";
+					g.style.width = r.width + "px";
+					g.style.height = r.height + "px";
+					g.style.margin = "0";
+					g.style.zIndex = "100000";
+					g.style.pointerEvents = "none";
+					g.style.transition = "none";
+					g.style.transform = "scale(1.06)";
+					g.style.boxShadow = "0 14px 34px rgba(0,0,0,.75)";
+					document.body.appendChild(g);
+					t.style.opacity = ".35";
+					t._drag = { g: g, sx: e.clientX, sy: e.clientY, dx: 0, dy: 0, over: false };
+					try { t.setPointerCapture(e.pointerId); } catch (err) {}
+					e.preventDefault();
+				}
+				function onMove(e) {
+					const d = e.currentTarget._drag;
+					if (!d) return;
+					d.dx = e.clientX - d.sx;
+					d.dy = e.clientY - d.sy;
+					d.g.style.transform = "translate(" + d.dx + "px, " + d.dy + "px) scale(1.06)";
+					const over = Math.sqrt(d.dx * d.dx + d.dy * d.dy) > DRAG_PLAY_PX;
+					if (over !== d.over) { d.over = over; if (onZone) onZone(over); }
+				}
+				function onUp(e) {
+					const t = e.currentTarget;
+					const d = t._drag;
+					if (!d) return;
+					t._drag = null;
+					t.style.opacity = "";
+					suppressClickUntil = Date.now() + 400;
+					const dist = Math.sqrt(d.dx * d.dx + d.dy * d.dy);
+					if (onZone) onZone(false);
+					if (dist > DRAG_PLAY_PX && payload) {
+						d.g.remove();
+						console.log("[stall-heal]", "drag-play dist=" + Math.round(dist) + " bvid=" + (c.bvid || ""));
+						clearOverlay();
+						play(payload);
+					} else {
+						const g = d.g;
+						g.style.transition = "transform .18s ease";
+						g.style.transform = "translate(0px, 0px)";
+						setTimeout(() => { try { g.remove(); } catch (err) {} }, 200);
+					}
+				}
 				return React.createElement("div", {
 					key: c.bvid || i,
-					draggable: true,
-					onDragStart: (e) => { e.dataTransfer.setData("text/plain", c.raw || c.bvid || c.url || ""); e.dataTransfer.effectAllowed = "copy"; },
-					style: { width: 172, height: 229, borderRadius: 10, background: "linear-gradient(#2a2a3a,#16161f)", cursor: "grab", position: "relative", overflow: "hidden", flex: "none", boxSizing: "border-box", boxShadow: "0 6px 18px rgba(0,0,0,.55)", border: "3px solid " + rarity },
+					onPointerDown: onDown,
+					onPointerMove: onMove,
+					onPointerUp: onUp,
+					onPointerCancel: onUp,
+					style: { width: 172, height: 229, borderRadius: 10, background: "linear-gradient(#2a2a3a,#16161f)", cursor: "grab", position: "relative", overflow: "hidden", flex: "none", flexShrink: 0, boxSizing: "border-box", boxShadow: "0 6px 18px rgba(0,0,0,.55)", border: "3px solid " + rarity, touchAction: "none", userSelect: "none", WebkitUserSelect: "none" },
 				},
 					c.pic ? React.createElement("img", { src: c.pic, alt: "", draggable: false, referrerPolicy: "no-referrer", onError: (e) => { e.currentTarget.style.display = "none"; }, style: { width: "100%", height: 128, objectFit: "cover", display: "block", pointerEvents: "none" } }) : React.createElement("div", { style: { height: 128, display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center", padding: 10, boxSizing: "border-box", fontSize: 11, color: "#8a8a9a", lineHeight: 1.3 } }, "无封面"),
 					x > 0 ? React.createElement("div", { style: { position: "absolute", top: 6, left: 6, background: "#1b3a8a", borderRadius: 999, padding: "2px 8px", color: "#fff", fontSize: 11, fontWeight: 600 } }, fmtDuration(x)) : null,
@@ -815,7 +874,7 @@ window.__ModuleLoader__.load({
 				}, [cards]);
 				if (!cards || !cards.length) return null;
 				return React.createElement("div", {
-					onClick: () => clearOverlay(),
+					onClick: () => { if (Date.now() < suppressClickUntil) return; clearOverlay(); },
 					style: { position: "fixed", inset: 0, zIndex: 99999, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "rgba(6,6,12,.84)", backdropFilter: "blur(4px)", WebkitBackdropFilter: "blur(4px)" },
 				},
 					React.createElement("div", { style: { position: "absolute", top: 16, right: 18, display: "flex", gap: 10, alignItems: "center", pointerEvents: "none", padding: "6px 12px", borderRadius: 8, background: "rgba(0,0,0,.4)", border: "1px solid rgba(255,255,255,.12)" } },
@@ -828,17 +887,15 @@ window.__ModuleLoader__.load({
 						style: { position: "absolute", top: 14, left: 14, width: 32, height: 32, borderRadius: 8, fontSize: 15, lineHeight: "1", cursor: "pointer", background: "rgba(255,255,255,.12)", border: "1px solid rgba(255,255,255,.25)", color: "#fff" }
 					}, "✕"),
 					React.createElement("div", {
-						onDragOver: (e) => { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; setDragOver(true); },
-						onDragLeave: () => setDragOver(false),
-						onDrop: (e) => { e.preventDefault(); setDragOver(false); const v = e.dataTransfer.getData("text/plain"); if (v) { clearOverlay(); play(v); } },
+						// 投放区现为纯视觉目标：pointer 位移达阈值即播，不再承担 drop 触发职责
 						style: { width: "min(720px, 60vw)", height: "38vh", borderRadius: 18, display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center", padding: 20, boxSizing: "border-box", border: dragOver ? "3px solid #ff4444" : "2px dashed rgba(255,255,255,.3)", background: dragOver ? "rgba(255,40,40,.16)" : "rgba(255,255,255,.05)", boxShadow: dragOver ? "0 0 70px rgba(255,40,40,.85), inset 0 0 90px rgba(255,40,40,.35)" : "none", transition: "all .14s" }
 					},
 						React.createElement("div", { style: { fontSize: dragOver ? 24 : 15, fontWeight: 700, whiteSpace: "pre-line", lineHeight: 1.65, color: dragOver ? "#ff6b6b" : "#a9adc7" } }, dragOver ? "松手开始播放 ▶" : "🃏 把卡片拖到这里\n松手开始播放")
 					),
 					React.createElement("div", {
 						onClick: (e) => e.stopPropagation(),
-						style: { position: "absolute", bottom: 22, left: 0, right: 0, display: "flex", gap: 16, justifyContent: "center", flexWrap: "wrap", padding: "0 20px" }
-					}, cards.map((c, k) => HsCardEl(c, k)))
+						style: { position: "absolute", bottom: 22, left: 0, right: 0, display: "flex", gap: 16, justifyContent: "flex-start", alignItems: "center", flexWrap: "nowrap", overflowX: "auto", overflowY: "hidden", WebkitOverflowScrolling: "touch", padding: "6px 20px", boxSizing: "border-box", maxHeight: 241, backgroundImage: "linear-gradient(to right, rgba(6,6,12,.84) 32%, rgba(6,6,12,0)), linear-gradient(to left, rgba(6,6,12,.84) 32%, rgba(6,6,12,0)), radial-gradient(farthest-side at 0 50%, rgba(0,0,0,.55), rgba(0,0,0,0)), radial-gradient(farthest-side at 100% 50%, rgba(0,0,0,.55), rgba(0,0,0,0))", backgroundRepeat: "no-repeat", backgroundSize: "44px 100%, 44px 100%, 16px 100%, 16px 100%", backgroundPosition: "0 0, 100% 0, 0 0, 100% 0", backgroundAttachment: "local, local, scroll, scroll" }
+					}, cards.map((c, k) => HsCardEl(c, k, setDragOver)))
 				);
 			}
 
