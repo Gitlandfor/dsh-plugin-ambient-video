@@ -586,8 +586,8 @@ function apply(ctx) {
     })
     ctx.effect(() => offLocal)
 
-    // ---- B站 VOD 直链解析 ?bvid= &page= → {url: durl mp4 直链, duration, title}（fnval=1 老式 durl，480P 匿名可拿）----
-    let playurlCache = { at: 0, key: '', url: '', duration: 0, title: '' }
+    // ---- B站 VOD 直链解析 ?bvid= &page= [&seg=] → {url: durl mp4 直链, duration, title, segIndex, segCount}（fnval=1 老式 durl，480P 匿名可拿）----
+    let playurlCache = { at: 0, key: '', url: '', segs: [], duration: 0, title: '' }
     // 播放令牌：直链由 /ambient-playurl 铸造，浏览器只拿 token 不拿 URL
     // （原 ?url= 白名单只含 bilivideo/bilibili/hdslb，B站第三方 CDN 如 mountaintoys.cn 会被 403；
     //  且客户端传 URL 有 SSRF 面。token 由 Host 自己签，代理查表取链，天然安全且不限 CDN）
@@ -600,14 +600,17 @@ function apply(ctx) {
           const u = new URL(req.url || '/', 'http://internal')
           const bvid = String(u.searchParams.get('bvid') || '')
           const page = Number(u.searchParams.get('page') || '1') || 1
+          const segRaw = Number(u.searchParams.get('seg') || '0')
+          const seg = Number.isFinite(segRaw) && segRaw > 0 ? Math.floor(segRaw) : 0
           const fail = (err) => { alog('/ambient-playurl', 'bvid=' + bvid.replace(/[^0-9A-Za-z]/g, '').slice(0, 16) + ' status=200 reason=' + String(err).replace(/\s+/g, '_')); json(res, { ok: false, error: err }) }
           if (!/^BV[0-9A-Za-z]+$/.test(bvid)) { fail('bad-bvid'); return }
           const key = bvid + '|' + page
           const mint = (url) => { const tk = crypto.randomBytes(12).toString('base64url'); playTokens.set(tk, url); if (playTokens.size > 60) { const first = playTokens.keys().next().value; if (first) playTokens.delete(first) }; return tk }
-          if (playurlCache.key === key && Date.now() - playurlCache.at < 15000) {
-            const tk = mint(playurlCache.url)
-            alog('/ambient-playurl', 'tk=' + tk.slice(0, 12) + ' bvid=' + bvid + ' status=200 reason=ok cached=1')
-            json(res, { ok: true, url: playurlCache.url, tk, duration: playurlCache.duration, title: playurlCache.title, pic: playurlCache.pic || '', cached: true })
+          if (playurlCache.key === key && Date.now() - playurlCache.at < 15000 && Array.isArray(playurlCache.segs) && seg < playurlCache.segs.length) {
+            const segs = playurlCache.segs
+            const tk = mint(segs[seg])
+            alog('/ambient-playurl', 'tk=' + tk.slice(0, 12) + ' bvid=' + bvid + ' seg=' + seg + ' status=200 reason=ok cached=1 segCount=' + segs.length)
+            json(res, { ok: true, url: segs[seg], tk, duration: playurlCache.duration, title: playurlCache.title, pic: playurlCache.pic || '', cached: true, segIndex: seg, segCount: segs.length })
             return
           }
           // 完整浏览器特征头：B站 WAF 对裸请求会 429（与 search/fav 侧同款铁律）
@@ -638,12 +641,16 @@ function apply(ctx) {
           const puUrl = 'https://api.bilibili.com/x/player/playurl?bvid=' + encodeURIComponent(bvid) + '&cid=' + cid + '&qn=16&fnval=1&fnver=0'
           const pd = parseBili('playurl', await httpsGetText(puUrl, biliHdr))
           if (!pd || pd.code !== 0 || !pd.data || !pd.data.durl || !pd.data.durl.length) { fail('playurl-api:' + String(pd && pd.code)); return }
-          const url = String(pd.data.durl[0].url || '')
-          if (!url) { fail('no-durl'); return }
-          playurlCache = { at: Date.now(), key, url, duration: Number(vd.data.duration) || 0, title: String(vd.data.title || ''), pic: String(vd.data.pic || '') }
+          // 多段 durl：B站把超长合集（如 50 首精选，3h42m）切成若干 mp4 段，只播 durl[0] 会在
+          // 第 1 段播完时静默结束。这里整表缓存，seg 由客户端播到下一段时现铸（CDN 直链有时效，预铸会囤过期链）
+          const segs = pd.data.durl.map((d) => String((d && d.url) || '')).filter(Boolean)
+          if (!segs.length) { fail('no-durl'); return }
+          const idx = seg < segs.length ? seg : 0
+          const url = segs[idx]
+          playurlCache = { at: Date.now(), key, url: segs[0], segs, duration: Number(vd.data.duration) || 0, title: String(vd.data.title || ''), pic: String(vd.data.pic || '') }
           const tk = mint(url)
-          alog('/ambient-playurl', 'tk=' + tk.slice(0, 12) + ' bvid=' + bvid + ' status=200 reason=ok')
-          json(res, { ok: true, url, tk, duration: playurlCache.duration, title: playurlCache.title, pic: playurlCache.pic })
+          alog('/ambient-playurl', 'tk=' + tk.slice(0, 12) + ' bvid=' + bvid + ' seg=' + idx + ' status=200 reason=ok segCount=' + segs.length)
+          json(res, { ok: true, url, tk, duration: playurlCache.duration, title: playurlCache.title, pic: playurlCache.pic, segIndex: idx, segCount: segs.length })
         } catch (e) { alog('/ambient-playurl', 'status=500 reason=playurl-fail:' + String(e && e.message || e).slice(0, 60)); json(res, { ok: false, error: 'playurl-fail' }) }
       },
     })
@@ -652,7 +659,8 @@ function apply(ctx) {
     // ---- B站直链代理转发 ?url= （upos CDN 强制 Referer: bilibili.com，浏览器 <video> 不能自定义 → 必须经 Host 转发；支持 Range）----
     // 断流重连：B站 CDN 空闲 ~60s 会 RST，旧实现 up.pipe(res) 死后不重开，客户端看门狗重铸 tk 也喂不出数据。
     // 现在记「已写入 res 的字节数」written，上游提前断 → 退避重连一条 Range: bytes=(startAt+written)- 的上游，
-    // 续写同一个 res（浏览器视角是连续字节流）。≤5 次，耗尽干净结束。
+    // 续写同一个 res（浏览器视角是连续字节流）。≤12 次（退避 1/2/4/8/16s，16s 封顶），耗尽干净结束。
+    // 上限给到 12 是为了 136MB 那种大文件在 CDN 频繁断连时多扛一会儿。
     // 重连被回非 206 = 上游拒绝续传（会从 0 重发，拼上就重复字节）→ 不拼，直接结束交给客户端整条重建，不死循环。
     const offProxy = webServer.register({
       kind: 'exact',
@@ -689,12 +697,12 @@ function apply(ctx) {
           }
           const retry = (why) => {
             if (closed || rt) return // 单飞闸门：同一时刻只挂一个重连，杜绝双上游同时写 res
-            if (status >= 400 || retries >= 5) {
+            if (status >= 400 || retries >= 12) {
               if (why === 'short-read') alog('/ambient-proxy', tag + ' host=' + parsed.hostname + ' short-read-exhausted sent=' + written + ' total=' + fmtTotal(fileTotal) + ' retries=' + retries)
               return done(why === 'short-read' ? 'short-read-exhausted' : why + '+exhausted')
             }
             retries++
-            rt = setTimeout(() => { rt = null; if (!closed) open() }, 1000 * 2 ** (retries - 1))
+            rt = setTimeout(() => { rt = null; if (!closed) open() }, 1000 * Math.min(16, 2 ** (retries - 1)))
           }
           const open = () => {
             const headers = { 'User-Agent': UA, 'Referer': 'https://www.bilibili.com/' }

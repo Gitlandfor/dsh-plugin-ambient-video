@@ -29,6 +29,7 @@ window.__ModuleLoader__.load({
 			const thresholdMs = opts.thresholdMs || STALL_WATCHDOG_MS;
 			const maxRetries = opts.maxRetries || STALL_MAX_RETRIES;
 			const healGraceMs = opts.healGraceMs || STALL_HEAL_GRACE_MS;
+			const getSeg = opts.getSeg || function () { return null; };
 			let lastGoodTime = 0;     // 最后良态播放位置（续播点）
 			let lastProgressAt = 0;   // 最近一次确认媒体仍在推进的时刻
 			let resumeTarget = -1;    // 本次自愈要续播的位置（恢复并越过它才重置重试计数）
@@ -39,6 +40,7 @@ window.__ModuleLoader__.load({
 			let seenProgress = false; // 见过一次 t>0 的 timeupdate；未见过时由「从未开播」判据(neverStarted)放行
 			let stalledAt = 0;        // 最近一次 stalled/waiting 事件时刻
 			let graceUntil = 0;       // 自愈后的宽限截止时刻
+			let pendingSeg = -1;      // 已发起但没换成功的段下标（-1 = 无）：切段现铸失败时兜底重试，否则合集会静默停死
 			let timer = null;
 			let handlers = null;
 
@@ -70,10 +72,12 @@ window.__ModuleLoader__.load({
 				try { onGiveUp(); } catch (e) {}
 				stopWatch();
 			}
-			function beginHeal(reason) {
+			function beginHeal(reason, segOverride) {
 				healing = true;
 				const attempt = retries + 1;
-				const pos = lastGoodTime;
+				const segSw = segOverride === null || segOverride === undefined ? -1 : segOverride;
+				// 换段续播从新段第 0 秒起，同段自愈续到断点
+				const pos = segSw >= 0 ? 0 : lastGoodTime;
 				log("HEAL " + reason + " pos=" + pos.toFixed(2) + " " + diag() + " attempt=" + attempt + "/" + maxRetries +
 					" (retry-in " + (STALL_RETRY_DELAYS[retries] || 0) + "ms)");
 				graceUntil = now() + healGraceMs;
@@ -89,12 +93,13 @@ window.__ModuleLoader__.load({
 					lastProgressAt = now();
 				};
 				safety = setTo(() => { log("heal-finish-timeout"); finish(); }, healGraceMs + 15000);
-				Promise.resolve().then(() => onStall(pos, attempt, finish))
+				Promise.resolve().then(() => onStall(pos, attempt, finish, segSw))
 					.catch((e) => { try { log("heal-error: " + e); } catch (e2) {} finish(); })
 					.then(() => {
 						if (disposed) return;
 						retries = attempt;
 						resumeTarget = pos;
+						if (segSw >= 0) { lastGoodTime = 0; }
 					});
 			}
 			function triggerStall(reason) {
@@ -117,6 +122,14 @@ window.__ModuleLoader__.load({
 				const v = getEl();
 				if (!v) { lastProgressAt = now(); }
 				else {
+					// 换段现铸失败（风控/网络）→ 元素还停在 ended：同一预算内补投该段，成功后 ended=false 自动收口
+					if (pendingSeg >= 0) {
+						if (!v.ended) pendingSeg = -1;
+						else if (!healing && now() >= graceUntil) {
+							if (retries >= maxRetries) { log("stall-heal seg-giveup i=" + pendingSeg); pendingSeg = -1; }
+							else { log("stall-heal seg-retry i=" + pendingSeg + " segCount=" + (Number(getSeg() && getSeg().segCount) || 0)); beginHeal("seg-retry", pendingSeg); }
+						}
+					}
 					// 盲区补口：一秒都没播出来（currentTime 恒 0、readyState<3 时更确定）时 seenProgress 永不置真，
 					// 这里放行判据并用 NEVER_STARTED_MS 作为阈值
 					const neverStarted = !seenProgress && !(v.currentTime > 0);
@@ -133,6 +146,15 @@ window.__ModuleLoader__.load({
 				}
 				timer = setTo(tick, 1000);
 			}
+			// 多段 durl 合集：本段正常播完 → 现铸下一段续播；已是最后一段 → 回第 0 段整单循环
+			function segPlan() {
+				const s = getSeg();
+				const count = Number(s && s.segCount) || 0;
+				if (!(count > 1)) return null; // 非合集/老视频：行为与以前完全一致（播完就结束）
+				const index = Math.max(0, Math.floor(Number(s && s.segIndex) || 0));
+				const wrap = index + 1 >= count;
+				return { next: wrap ? 0 : index + 1, count: count, wrap: wrap };
+			}
 			function attach(v) {
 				if (disposed || !v) return;
 				lastGoodTime = v.currentTime || 0;
@@ -141,7 +163,7 @@ window.__ModuleLoader__.load({
 				const onT = () => noteProgress(v.currentTime || 0);
 				const onP = () => noteLiveness();
 				const onPause = () => { paused = true; };
-				const onPlay = () => { paused = false; retries = 0; resumeTarget = -1; lastProgressAt = now(); };
+				const onPlay = () => { paused = false; retries = 0; resumeTarget = -1; pendingSeg = -1; lastProgressAt = now(); };
 				const onStallEvt = () => { stalledAt = now(); };
 				const onEnd = () => {
 					paused = true;
@@ -154,7 +176,15 @@ window.__ModuleLoader__.load({
 						if (retries >= maxRetries) { giveUp("ended"); return; }
 						log("stall-heal ended-truncated current=" + cur.toFixed(2) + " duration=" + dur.toFixed(2));
 						beginHeal("ended-truncated");
+						return;
 					}
+					// 本段正常播完：多段合集现铸下一段续播（不设错误文字、不动自愈预算），单段视频照旧静默结束
+					const plan = segPlan();
+					if (!plan) return;
+					if (now() < graceUntil) return; // 刚换过源还在宽限窗口，别连环切段
+					log("stall-heal " + (plan.wrap ? "seg-loop" : "seg-advance") + " i=" + plan.next + " segCount=" + plan.count);
+					pendingSeg = plan.next;
+					beginHeal(plan.wrap ? "seg-loop" : "seg-advance", plan.next);
 				};
 				handlers = { onT, onP, onPause, onPlay, onStallEvt, onEnd };
 				v.addEventListener("timeupdate", onT);
@@ -196,17 +226,21 @@ window.__ModuleLoader__.load({
 			const getDisposed = opts.getDisposed || function () { return false; };
 			const SEEK_MAX_TRIES = 5;                   // 等 seekable 就绪上限（5×1.2s≈6s + 2500ms 首发），防卡在静音黑屏
 			const SEEK_RETRY_MS = 1200;
-			return function heal(pos, attempt, finish) {
+			return function heal(pos, attempt, finish, segOverride) {
 				if (!finish) finish = function () {};
 				const ctx = getCtx() || { bvid: "", page: 1 };
-				return fetchFn("/ambient-playurl?bvid=" + encodeURIComponent(ctx.bvid) + "&page=" + ctx.page)
+				// segOverride >=0 = 切到指定段（合集续播）；否则重铸当前段（断链自愈）
+				const seg = segOverride != null && Number.isFinite(Number(segOverride)) && Number(segOverride) >= 0 ? Math.floor(Number(segOverride)) : Math.floor(Number(ctx.segIndex) || 0);
+				return fetchFn("/ambient-playurl?bvid=" + encodeURIComponent(ctx.bvid) + "&page=" + ctx.page + "&seg=" + seg)
 					.then((r) => r.json())
 					.then((r) => {
 						if (!r || !r.ok) { log("playurl refetch fail: " + ((r && r.error) || "?")); finish(); return; }
 						const el = getEl();
 						if (!el || getDisposed()) { finish(); return; }
+						if (Number.isFinite(Number(r.segIndex))) ctx.segIndex = Math.floor(Number(r.segIndex));
+						if (Number.isFinite(Number(r.segCount))) ctx.segCount = Math.floor(Number(r.segCount));
 						const src2 = r.tk ? "/ambient-proxy?t=" + r.tk : "/ambient-proxy?url=" + encodeURIComponent(r.url);
-						log("new tk minted, src=" + src2.slice(0, 40) + "… resume pos=" + pos.toFixed(2));
+						log("new tk minted, src=" + src2.slice(0, 40) + "… seg=" + (r.segIndex || 0) + "/" + (r.segCount || 1) + " resume pos=" + pos.toFixed(2));
 						// 换源前先暂停+强制静音：autoPlay 在 load() 后会从 0 起播，先把这个窗口压成无声
 						const wasMuted = el.muted;
 						try { el.pause(); } catch (e) {}
@@ -460,7 +494,7 @@ window.__ModuleLoader__.load({
 
 			// B站 VOD 原生播放（playurl 直链 + Host 代理转发 + loop 属性循环）
 			function playBiliVod(parsed) {
-				biliPlayCtx = { bvid: parsed.bvid, page: parsed.page || 1 };
+				biliPlayCtx = { bvid: parsed.bvid, page: parsed.page || 1, segIndex: 0, segCount: 1 };
 				setState({ src: "", site: "bili", native: true, nativeLoop: true, playing: true, nonce: state.nonce + 1, duration: 0, loopInfo: "B站VOD：正在获取直链…", error: "" });
 				fetch("/ambient-playurl?bvid=" + encodeURIComponent(parsed.bvid) + "&page=" + parsed.page).then((r) => r.json()).then((r) => {
 					if (!r || !r.ok) { setState({ playing: false, error: "B站直链获取失败（" + ((r && r.error) || "") + "）：可能被风控，稍后重试" }); return; }
@@ -469,10 +503,17 @@ window.__ModuleLoader__.load({
 						const rec = h.find((x) => x.site === "bili" && x.bvid === parsed.bvid);
 						if (rec) { rec.title = r.title || rec.title; rec.pic = r.pic || rec.pic; rec.duration = r.duration || rec.duration; window.localStorage.setItem(HISTORY_KEY, JSON.stringify(h)); }
 					} catch (e) { /* ignore */ }
+					// 多段 durl 合集：关掉原生 loop（否则浏览器静默回绕第 0 段，永远播不完整个合集），
+					// 改由 ended 分支逐段现铸续播 + 整单循环。segCount<=1 → 完全维持原状
+					const segCount = Math.floor(Number(r.segCount) || 1);
+					const segIndex = Math.floor(Number(r.segIndex) || 0);
+					biliPlayCtx.segCount = segCount;
+					biliPlayCtx.segIndex = segIndex;
+					const multi = segCount > 1;
 					setState({
 						src: r.tk ? "/ambient-proxy?t=" + r.tk : "/ambient-proxy?url=" + encodeURIComponent(r.url),
-						native: true, nativeLoop: true, duration: r.duration || 0, pic: r.pic || "",
-						loopInfo: "B站VOD（原生480P循环）：" + (r.title || parsed.bvid),
+						native: true, nativeLoop: !multi, duration: r.duration || 0, pic: r.pic || "",
+						loopInfo: (multi ? "B站VOD（原生480P分段合集 " + (segIndex + 1) + "/" + segCount + "）：" : "B站VOD（原生480P循环）：") + (r.title || parsed.bvid),
 						error: "",
 					});
 				}).catch(() => { setState({ playing: false, error: "B站直链接口异常" }); });
@@ -583,7 +624,8 @@ window.__ModuleLoader__.load({
 							});
 							wd = createStallWatchdog({
 								getEl: () => ref.current,
-								onStall: (pos, attempt, finish) => healBiliVod(pos, attempt, finish),
+								onStall: (pos, attempt, finish, segOverride) => healBiliVod(pos, attempt, finish, segOverride),
+								getSeg: () => biliPlayCtx,
 								onGiveUp: () => { try { setState({ error: "B站VOD播放中断，多次重铸令牌续播失败（网络或CDN问题），已停止" }); } catch (e) {} },
 								log: healLog,
 							});
