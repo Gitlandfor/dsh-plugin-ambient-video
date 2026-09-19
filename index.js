@@ -41,6 +41,8 @@ function apply(ctx) {
   const delay = async () => { if (timer) { try { await timer.timeout(300) } catch (e) {} } }
   const R = (p) => path.resolve(p)
   const esc = (p) => JSON.stringify(String(p)) // 拼 shell 参数的 JSON 字面量（安全）
+  // 请求级日志（单行 ≤200B，禁止逐字节）：时间 + 路由 + 字段串
+  const alog = (route, fields) => { try { console.log(('[ambient] ' + new Date().toISOString() + ' ' + route + ' ' + fields).slice(0, 200)) } catch (e) {} }
 
   // ---- B站收藏辅助（curlJson / wbi 签名；供 /ambient-fav/* 路由与 /playask 共用）----
   const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36'
@@ -561,14 +563,17 @@ function apply(ctx) {
           const u = new URL(req.url || '/', 'http://internal')
           const bvid = String(u.searchParams.get('bvid') || '')
           const page = Number(u.searchParams.get('page') || '1') || 1
-          if (!/^BV[0-9A-Za-z]+$/.test(bvid)) { json(res, { ok: false, error: 'bad-bvid' }); return }
+          const fail = (err) => { alog('/ambient-playurl', 'bvid=' + bvid.replace(/[^0-9A-Za-z]/g, '').slice(0, 16) + ' status=200 reason=' + String(err).replace(/\s+/g, '_')); json(res, { ok: false, error: err }) }
+          if (!/^BV[0-9A-Za-z]+$/.test(bvid)) { fail('bad-bvid'); return }
           const key = bvid + '|' + page
-          const mint = (u) => { const tk = crypto.randomBytes(12).toString('base64url'); playTokens.set(tk, u); if (playTokens.size > 60) { const first = playTokens.keys().next().value; if (first) playTokens.delete(first) }; return tk }
+          const mint = (url) => { const tk = crypto.randomBytes(12).toString('base64url'); playTokens.set(tk, url); if (playTokens.size > 60) { const first = playTokens.keys().next().value; if (first) playTokens.delete(first) }; return tk }
           if (playurlCache.key === key && Date.now() - playurlCache.at < 15000) {
-            json(res, { ok: true, url: playurlCache.url, tk: mint(playurlCache.url), duration: playurlCache.duration, title: playurlCache.title, pic: playurlCache.pic || '', cached: true })
+            const tk = mint(playurlCache.url)
+            alog('/ambient-playurl', 'tk=' + tk.slice(0, 12) + ' bvid=' + bvid + ' status=200 reason=ok cached=1')
+            json(res, { ok: true, url: playurlCache.url, tk, duration: playurlCache.duration, title: playurlCache.title, pic: playurlCache.pic || '', cached: true })
             return
           }
-          if (!shell) { json(res, { ok: false, error: 'no-shell' }); return }
+          if (!shell) { fail('no-shell'); return }
           // view API 拿 cid（与 /ambient-info 同款：web/curl 双源）
           const viewUrl = 'https://api.bilibili.com/x/web-interface/view?bvid=' + encodeURIComponent(bvid)
           let vText = ''
@@ -579,29 +584,35 @@ function apply(ctx) {
             if (vr && vr.stdout) vText = vr.stdout.text || ''
           }
           const vd = JSON.parse(vText)
-          if (!vd || vd.code !== 0 || !vd.data) { json(res, { ok: false, error: 'view-api:' + String(vd && vd.code) }); return }
+          if (!vd || vd.code !== 0 || !vd.data) { fail('view-api:' + String(vd && vd.code)); return }
           let cid = Number(vd.data.cid) || 0
           if (page > 1 && Array.isArray(vd.data.pages)) {
             const pg = vd.data.pages.find((x) => Number(x.page) === page)
             if (pg && Number(pg.cid)) cid = Number(pg.cid)
           }
-          if (!cid) { json(res, { ok: false, error: 'no-cid' }); return }
+          if (!cid) { fail('no-cid'); return }
           // playurl API fnval=1 拿 durl mp4 直链；qn=32(480P) 匿名即可
           const puUrl = 'https://api.bilibili.com/x/player/playurl?bvid=' + encodeURIComponent(bvid) + '&cid=' + cid + '&qn=16&fnval=1&fnver=0'
           const puSpec = shell.resolve({ command: 'curl -s --max-time 12 -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36" -H "Referer: https://www.bilibili.com/" ' + JSON.stringify(puUrl), timeoutMs: 15000, stdoutMaxBytes: 2097152 })
           const pur = await shell.run(puSpec)
           const pd = JSON.parse(pur && pur.stdout ? (pur.stdout.text || '{}') : '{}')
-          if (!pd || pd.code !== 0 || !pd.data || !pd.data.durl || !pd.data.durl.length) { json(res, { ok: false, error: 'playurl-api:' + String(pd && pd.code) }); return }
+          if (!pd || pd.code !== 0 || !pd.data || !pd.data.durl || !pd.data.durl.length) { fail('playurl-api:' + String(pd && pd.code)); return }
           const url = String(pd.data.durl[0].url || '')
-          if (!url) { json(res, { ok: false, error: 'no-durl' }); return }
+          if (!url) { fail('no-durl'); return }
           playurlCache = { at: Date.now(), key, url, duration: Number(vd.data.duration) || 0, title: String(vd.data.title || ''), pic: String(vd.data.pic || '') }
-          json(res, { ok: true, url, tk: mint(url), duration: playurlCache.duration, title: playurlCache.title, pic: playurlCache.pic })
-        } catch (e) { json(res, { ok: false, error: 'playurl-fail' }) }
+          const tk = mint(url)
+          alog('/ambient-playurl', 'tk=' + tk.slice(0, 12) + ' bvid=' + bvid + ' status=200 reason=ok')
+          json(res, { ok: true, url, tk, duration: playurlCache.duration, title: playurlCache.title, pic: playurlCache.pic })
+        } catch (e) { alog('/ambient-playurl', 'status=500 reason=playurl-fail:' + String(e && e.message || e).slice(0, 60)); json(res, { ok: false, error: 'playurl-fail' }) }
       },
     })
     ctx.effect(() => offPlayurl)
 
     // ---- B站直链代理转发 ?url= （upos CDN 强制 Referer: bilibili.com，浏览器 <video> 不能自定义 → 必须经 Host 转发；支持 Range）----
+    // 断流重连：B站 CDN 空闲 ~60s 会 RST，旧实现 up.pipe(res) 死后不重开，客户端看门狗重铸 tk 也喂不出数据。
+    // 现在记「已写入 res 的字节数」written，上游提前断 → 退避重连一条 Range: bytes=(startAt+written)- 的上游，
+    // 续写同一个 res（浏览器视角是连续字节流）。≤5 次，耗尽干净结束。
+    // 重连被回非 206 = 上游拒绝续传（会从 0 重发，拼上就重复字节）→ 不拼，直接结束交给客户端整条重建，不死循环。
     const offProxy = webServer.register({
       kind: 'exact',
       path: '/ambient-proxy',
@@ -611,34 +622,67 @@ function apply(ctx) {
           const tk = String(u.searchParams.get('t') || '')
           const cachedTarget = tk ? (playTokens.get(tk) || '') : ''
           const target = cachedTarget || String(u.searchParams.get('url') || '')
-          if (!target) { try { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'no-target' })) } catch (e) {} return }
-          // 直传 ?url= 走白名单（只允许 bilibili CDN，防 SSRF）；
-          // ?t= 是 Host 自己签的令牌，已在上一步查表取链，无需域名限制
-          if (!cachedTarget) {
-            const m = target.match(/^https?:\/\/([^/]+)/)
-            if (!m || !/(^|\.)(bilivideo\.com|bilibili\.com|hdslb\.com)$/i.test(m[1])) {
-              try { res.writeHead(403, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'domain-not-allowed' })) } catch (e) {}
-              return
-            }
+          const tag = 'tk=' + tk.slice(0, 12) + ' range=' + String(req.headers.range || '-').replace(/\s+/g, '_')
+          // 直传 ?url= 走白名单（防 SSRF）；?t= 令牌由 Host 自己签，查表取链无需限制
+          const m = target.match(/^https?:\/\/([^/]+)/)
+          if (!target) { alog('/ambient-proxy', tag + ' host=- status=404 reason=no-target'); json(res, { error: 'no-target' }, 404); return }
+          if (!cachedTarget && (!m || !/(^|\.)(bilivideo\.com|bilibili\.com|hdslb\.com)$/i.test(m[1]))) {
+            alog('/ambient-proxy', tag + ' host=- status=403 reason=domain-not-allowed'); json(res, { error: 'domain-not-allowed' }, 403); return
           }
-          // 用 http/https 模块转发（带 Referer/UA + Range），数据流式 pipe
           const mod = target.startsWith('https:') ? https : http
           const parsed = new URL(target)
-          const headers = {
-            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
-            'Referer': 'https://www.bilibili.com/',
+          const ms = String(req.headers.range || '').match(/^bytes=(\d+)/)
+          const startAt = ms ? Number(ms[1]) || 0 : 0 // 客户端 Range 起点，重连偏移= startAt+written
+          let written = 0, expect = 0, status = 0, retries = 0
+          let up = null, out = null, rt = null, closed = false
+          const done = (reason) => {
+            if (closed) return
+            closed = true
+            if (rt) clearTimeout(rt)
+            try { if (up) up.destroy() } catch (e) {}
+            try { if (out) out.destroy() } catch (e) {}
+            alog('/ambient-proxy', tag + ' host=' + parsed.hostname + ' status=' + status + ' reason=' + reason + ' retries=' + retries + ' sent=' + written)
+            try { if (!res.headersSent) res.writeHead(502); res.end() } catch (e) {}
           }
-          if (req.headers.range) headers['Range'] = req.headers.range
-          const out = mod.request({
-            hostname: parsed.hostname, port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-            path: parsed.pathname + parsed.search, method: 'GET', headers,
-          }, (up) => {
-            res.writeHead(up.statusCode || 502, up.headers)
-            up.pipe(res)
-          })
-          out.on('error', () => { try { res.writeHead(502); res.end() } catch (e) {} })
-          out.end()
+          const retry = (why) => {
+            if (closed || rt) return // 单飞闸门：同一时刻只挂一个重连，杜绝双上游同时写 res
+            if (status >= 400 || retries >= 5) return done(why + '+exhausted')
+            retries++
+            rt = setTimeout(() => { rt = null; if (!closed) open() }, 1000 * 2 ** (retries - 1))
+          }
+          const open = () => {
+            const headers = { 'User-Agent': UA, 'Referer': 'https://www.bilibili.com/' }
+            const range = written > 0 ? 'bytes=' + (startAt + written) + '-' : (req.headers.range || '')
+            if (range) headers['Range'] = range
+            out = mod.request({
+              hostname: parsed.hostname, port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+              path: parsed.pathname + parsed.search, method: 'GET', headers,
+            }, (r) => {
+              if (closed) { try { r.destroy() } catch (e) {} return }
+              up = r
+              status = r.statusCode || 0
+              if (written === 0) res.writeHead(status || 502, r.headers) // 首轮：状态/头原样透传
+              else if (status === 416) return done('end') // 偏移已到文件尾 = 已发完
+              else if (status !== 206) return done('no-range:' + status)
+              expect = written + (Number(r.headers['content-length']) || 0) // 本轮承诺的发完位置
+              let eof = false
+              r.on('data', (c) => { written += c.length; if (!res.write(c)) r.pause() })
+              r.on('end', () => { eof = true; if (expect && written < expect) retry('short-end'); else done('end') }) // 提前 FIN 也按断流重连
+              r.on('error', () => retry('up-error'))
+              r.on('close', () => { if (!eof) retry('up-close') })
+            })
+            out.on('error', () => retry('req-error'))
+            out.end()
+          }
+          res.on('drain', () => { try { if (up) up.resume() } catch (e) {} })
+          res.on('error', () => { done('res-error') }) // 客户端断开竞态下 res 报错只清理不抛
+          alog('/ambient-proxy', tag + ' host=' + parsed.hostname + ' status=- reason=req')
+          open()
+          // 客户端 abort 清理：浏览器换 src/关页 → 立即销毁上游+取消重连定时器，防 CLOSE-WAIT 孤儿
+          req.on('aborted', () => done('aborted'))
+          req.on('close', () => { if (!res.writableEnded) done('client-gone') })
         } catch (e) {
+          alog('/ambient-proxy', 'status=500 reason=throw:' + String(e && e.message || e).slice(0, 60).replace(/\s+/g, '_'))
           try { res.writeHead(500); res.end('proxy-err') } catch (e2) {}
         }
       },
