@@ -15,6 +15,7 @@ window.__ModuleLoader__.load({
 		const STALL_MAX_RETRIES = 3;                 // 同一段 stall 最多重试次数（有界，不无限循环）
 		const STALL_RETRY_DELAYS = [1000, 2000, 4000]; // 重试间隔递增
 		const STALL_HEAL_GRACE_MS = 10000;           // 自愈后给重缓冲(到续播点)的宽限窗口，避免连环误判
+		const NEVER_STARTED_MS = 12000;              // 一秒都没播出来（currentTime 仍为 0）多久判为卡死并自愈
 
 		// 独立工厂，便于 /tmp 单测用 mock el + 假时钟驱动
 		function createStallWatchdog(opts) {
@@ -35,15 +36,16 @@ window.__ModuleLoader__.load({
 			let healing = false;      // 正在铸 tk/重设 src，期间忽略一切事件
 			let disposed = false;
 			let paused = true;
-			let seenProgress = false; // 至少见过一次 t>0 的 timeupdate 才启用判 stall（初始加载失败走 error 通道）
+			let seenProgress = false; // 见过一次 t>0 的 timeupdate；未见过时由「从未开播」判据(neverStarted)放行
 			let stalledAt = 0;        // 最近一次 stalled/waiting 事件时刻
 			let graceUntil = 0;       // 自愈后的宽限截止时刻
 			let timer = null;
 			let handlers = null;
 
-			function eligible() {
+			function eligible(ignoreProgressGate) {
 				const v = getEl();
-				return !!(v && !paused && !v.ended && !v.seeking && !healing && seenProgress);
+				if (!v || paused || v.ended || v.seeking || healing) return false;
+				return seenProgress || !!ignoreProgressGate;
 			}
 			function noteProgress(t) {
 				const v = getEl();
@@ -57,18 +59,23 @@ window.__ModuleLoader__.load({
 				lastProgressAt = now();
 			}
 			function noteLiveness() { if (!healing) lastProgressAt = now(); }
-			function triggerStall() {
-				if (healing || disposed || !eligible()) return;
-				if (retries >= maxRetries) {
-					log("GIVE-UP pos=" + lastGoodTime.toFixed(2) + " after " + retries + " retries");
-					try { onGiveUp(); } catch (e) {}
-					stopWatch();
-					return;
-				}
+			function diag() {
+				const v = getEl();
+				return "currentTime=" + ((v && v.currentTime) || 0).toFixed(2) +
+					" readyState=" + (v ? v.readyState : -1) +
+					" retries=" + retries + "/" + maxRetries;
+			}
+			function giveUp(why) {
+				log("GIVE-UP " + why + " pos=" + lastGoodTime.toFixed(2) + " " + diag());
+				try { onGiveUp(); } catch (e) {}
+				stopWatch();
+			}
+			function beginHeal(reason) {
 				healing = true;
 				const attempt = retries + 1;
 				const pos = lastGoodTime;
-				log("STALL pos=" + pos.toFixed(2) + " attempt=" + attempt + "/" + maxRetries + " (retry-in " + (STALL_RETRY_DELAYS[retries] || 0) + "ms)");
+				log("HEAL " + reason + " pos=" + pos.toFixed(2) + " " + diag() + " attempt=" + attempt + "/" + maxRetries +
+					" (retry-in " + (STALL_RETRY_DELAYS[retries] || 0) + "ms)");
 				Promise.resolve().then(() => onStall(pos, attempt))
 					.catch((e) => { try { log("heal-error: " + e); } catch (e2) {} })
 					.then(() => {
@@ -80,15 +87,38 @@ window.__ModuleLoader__.load({
 						graceUntil = now() + healGraceMs;
 					});
 			}
+			function triggerStall(reason) {
+				if (healing || disposed || !eligible(reason === "never-started")) return;
+				if (retries >= maxRetries) { giveUp(reason); return; }
+				beginHeal(reason);
+			}
+			// media error 也走同一套自愈预算：返回 true 表示看门狗已接管（自愈或已放弃并报错）
+			function notifyError() {
+				if (disposed) return false;
+				log("media-error " + diag() + (healing ? " (heal in flight)" : ""));
+				if (healing) return true;
+				if (retries >= maxRetries) { giveUp("media-error"); return true; }
+				beginHeal("media-error");
+				return true;
+			}
 			function tick() {
 				if (disposed) return;
 				const v = getEl();
 				if (!v) { lastProgressAt = now(); }
-				else if (eligible() && now() >= graceUntil) {
-					const idle = now() - lastProgressAt;
-					const evBoost = (now() - stalledAt) < 1500;
-					const th = retries === 0 ? thresholdMs : (STALL_RETRY_DELAYS[retries - 1] || thresholdMs);
-					if (idle >= (evBoost && retries === 0 ? STALL_EVENT_MS : th)) { triggerStall(); if (disposed) return; }
+				else {
+					// 盲区补口：一秒都没播出来（currentTime 恒 0、readyState<3 时更确定）时 seenProgress 永不置真，
+					// 这里放行判据并用 NEVER_STARTED_MS 作为阈值
+					const neverStarted = !seenProgress && !(v.currentTime > 0);
+					if (eligible(neverStarted) && now() >= graceUntil) {
+						const idle = now() - lastProgressAt;
+						const evBoost = (now() - stalledAt) < 1500;
+						const th = retries === 0 ? thresholdMs : (STALL_RETRY_DELAYS[retries - 1] || thresholdMs);
+						const limit = neverStarted ? NEVER_STARTED_MS : (evBoost && retries === 0 ? STALL_EVENT_MS : th);
+						if (idle >= limit) {
+							triggerStall(neverStarted ? "never-started" : "stall");
+							if (disposed) return;
+						}
+					}
 				}
 				timer = setTo(tick, 1000);
 			}
@@ -129,7 +159,7 @@ window.__ModuleLoader__.load({
 				}
 				handlers = null;
 			}
-			return { attach, dispose: stopWatch };
+			return { attach, notifyError, dispose: stopWatch };
 		}
 
 		// B站VOD 自愈动作：重铸 tk + 重设 src + 续播到 lastGoodTime（独立工厂，可单测）
@@ -477,7 +507,10 @@ window.__ModuleLoader__.load({
 							wd.attach(el);
 						}
 					}
-					const onErr = () => { setState({ error: "视频播放出错（可能编码不支持或网络问题）" }); };
+					const onErr = () => {
+						if (wd && wd.notifyError()) return; // B站VOD：先走自愈预算，用尽后由 onGiveUp 报错
+						setState({ error: "视频播放出错（可能编码不支持或网络问题）" });
+					};
 					el.addEventListener("error", onErr);
 					return () => {
 						disposed = true;
@@ -502,6 +535,11 @@ window.__ModuleLoader__.load({
 			function BgVideo() {
 				const s = useStore();
 				if (!s.playing) {
+					// 播放未开始/已放弃且有错误：背景层直接给出原因（原先只在设置面板里，画面只剩全黑）
+					if (s.error) {
+						return React.createElement("div", { style: Object.assign({}, wrapStyle, { opacity: 1, filter: "none", display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }) },
+							React.createElement("div", { style: { maxWidth: 480, textAlign: "center", fontSize: 13, lineHeight: "20px", color: "var(--dsw-alias-label-secondary)" } }, s.error));
+					}
 					if (!s.src && !s.pic) return null;
 					if (!s.src) {
 						return React.createElement("div", { style: Object.assign({}, wrapStyle, { opacity: s.opacity, filter: "blur(" + s.blur + "px) brightness(" + s.brightness + ") saturate(1.05)" }) },
