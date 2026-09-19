@@ -7,6 +7,167 @@ window.__ModuleLoader__.load({
 		const React = require("react");
 		const inject = ["slots", "timer"];
 
+		// ---- B站VOD 断链自愈看门狗（仅 /ambient-proxy 原生播放路径）----
+		// 卡死机制：<video> 预读缓冲到某处后浏览器停读 socket（networkState=IDLE），上游 B站 CDN
+		// 空闲约 55~75s 后 RST 连接，播放永久卡在固定位置。自愈 = 判 stall → 重铸 tk → 重设 src → 续播。
+		const STALL_WATCHDOG_MS = 10000;             // 播放位置连续多久不前进判为 stall
+		const STALL_EVENT_MS = 2000;                 // 收到 stalled/waiting 事件后的提前触发阈值
+		const STALL_MAX_RETRIES = 3;                 // 同一段 stall 最多重试次数（有界，不无限循环）
+		const STALL_RETRY_DELAYS = [1000, 2000, 4000]; // 重试间隔递增
+		const STALL_HEAL_GRACE_MS = 10000;           // 自愈后给重缓冲(到续播点)的宽限窗口，避免连环误判
+
+		// 独立工厂，便于 /tmp 单测用 mock el + 假时钟驱动
+		function createStallWatchdog(opts) {
+			const getEl = opts.getEl;
+			const onStall = opts.onStall || function () { return Promise.resolve(); };
+			const onGiveUp = opts.onGiveUp || function () {};
+			const log = opts.log || function () {};
+			const now = opts.now || Date.now;
+			const setTo = opts.setTimeout || setTimeout;
+			const clearTo = opts.clearTimeout || clearTimeout;
+			const thresholdMs = opts.thresholdMs || STALL_WATCHDOG_MS;
+			const maxRetries = opts.maxRetries || STALL_MAX_RETRIES;
+			const healGraceMs = opts.healGraceMs || STALL_HEAL_GRACE_MS;
+			let lastGoodTime = 0;     // 最后良态播放位置（续播点）
+			let lastProgressAt = 0;   // 最近一次确认媒体仍在推进的时刻
+			let resumeTarget = -1;    // 本次自愈要续播的位置（恢复并越过它才重置重试计数）
+			let retries = 0;          // 当前 stall 段已重试次数
+			let healing = false;      // 正在铸 tk/重设 src，期间忽略一切事件
+			let disposed = false;
+			let paused = true;
+			let seenProgress = false; // 至少见过一次 t>0 的 timeupdate 才启用判 stall（初始加载失败走 error 通道）
+			let stalledAt = 0;        // 最近一次 stalled/waiting 事件时刻
+			let graceUntil = 0;       // 自愈后的宽限截止时刻
+			let timer = null;
+			let handlers = null;
+
+			function eligible() {
+				const v = getEl();
+				return !!(v && !paused && !v.ended && !v.seeking && !healing && seenProgress);
+			}
+			function noteProgress(t) {
+				const v = getEl();
+				if (!v || healing || v.seeking) return;
+				if (t > 0) seenProgress = true;
+				const wrap = v.duration > 0 && t > 0 && lastGoodTime > v.duration - 5 && t < 5;
+				if (t > lastGoodTime || wrap) {
+					lastGoodTime = t;
+					if (resumeTarget >= 0 && (t >= resumeTarget + 0.5 || wrap)) { retries = 0; resumeTarget = -1; log("recovered, retry counter reset"); }
+				}
+				lastProgressAt = now();
+			}
+			function noteLiveness() { if (!healing) lastProgressAt = now(); }
+			function triggerStall() {
+				if (healing || disposed || !eligible()) return;
+				if (retries >= maxRetries) {
+					log("GIVE-UP pos=" + lastGoodTime.toFixed(2) + " after " + retries + " retries");
+					try { onGiveUp(); } catch (e) {}
+					stopWatch();
+					return;
+				}
+				healing = true;
+				const attempt = retries + 1;
+				const pos = lastGoodTime;
+				log("STALL pos=" + pos.toFixed(2) + " attempt=" + attempt + "/" + maxRetries + " (retry-in " + (STALL_RETRY_DELAYS[retries] || 0) + "ms)");
+				Promise.resolve().then(() => onStall(pos, attempt))
+					.catch((e) => { try { log("heal-error: " + e); } catch (e2) {} })
+					.then(() => {
+						if (disposed) return;
+						retries = attempt;
+						resumeTarget = pos;
+						healing = false;
+						lastProgressAt = now();
+						graceUntil = now() + healGraceMs;
+					});
+			}
+			function tick() {
+				if (disposed) return;
+				const v = getEl();
+				if (!v) { lastProgressAt = now(); }
+				else if (eligible() && now() >= graceUntil) {
+					const idle = now() - lastProgressAt;
+					const evBoost = (now() - stalledAt) < 1500;
+					const th = retries === 0 ? thresholdMs : (STALL_RETRY_DELAYS[retries - 1] || thresholdMs);
+					if (idle >= (evBoost && retries === 0 ? STALL_EVENT_MS : th)) { triggerStall(); if (disposed) return; }
+				}
+				timer = setTo(tick, 1000);
+			}
+			function attach(v) {
+				if (disposed || !v) return;
+				lastGoodTime = v.currentTime || 0;
+				lastProgressAt = now();
+				paused = v.paused;
+				const onT = () => noteProgress(v.currentTime || 0);
+				const onP = () => noteLiveness();
+				const onPause = () => { paused = true; };
+				const onPlay = () => { paused = false; retries = 0; resumeTarget = -1; lastProgressAt = now(); };
+				const onStallEvt = () => { stalledAt = now(); };
+				const onEnd = () => { paused = true; };
+				handlers = { onT, onP, onPause, onPlay, onStallEvt, onEnd };
+				v.addEventListener("timeupdate", onT);
+				v.addEventListener("progress", onP);
+				v.addEventListener("stalled", onStallEvt);
+				v.addEventListener("waiting", onStallEvt);
+				v.addEventListener("play", onPlay);
+				v.addEventListener("pause", onPause);
+				v.addEventListener("ended", onEnd);
+				timer = setTo(tick, 1000);
+			}
+			function stopWatch() {
+				if (disposed) return;
+				disposed = true;
+				clearTo(timer);
+				const v = getEl();
+				if (v && handlers) {
+					v.removeEventListener("timeupdate", handlers.onT);
+					v.removeEventListener("progress", handlers.onP);
+					v.removeEventListener("stalled", handlers.onStallEvt);
+					v.removeEventListener("waiting", handlers.onStallEvt);
+					v.removeEventListener("play", handlers.onPlay);
+					v.removeEventListener("pause", handlers.onPause);
+					v.removeEventListener("ended", handlers.onEnd);
+				}
+				handlers = null;
+			}
+			return { attach, dispose: stopWatch };
+		}
+
+		// B站VOD 自愈动作：重铸 tk + 重设 src + 续播到 lastGoodTime（独立工厂，可单测）
+		function createBiliVodHealer(opts) {
+			const getEl = opts.getEl;
+			const getCtx = opts.getCtx;                 // () => {bvid, page}
+			const doPlay = opts.doPlay || function () {};
+			const log = opts.log || function () {};
+			const fetchFn = opts.fetch || fetch;
+			const setTo = opts.setTimeout || setTimeout;
+			const getDisposed = opts.getDisposed || function () { return false; };
+			return function heal(pos) {
+				const ctx = getCtx() || { bvid: "", page: 1 };
+				return fetchFn("/ambient-playurl?bvid=" + encodeURIComponent(ctx.bvid) + "&page=" + ctx.page)
+					.then((r) => r.json())
+					.then((r) => {
+						if (!r || !r.ok) { log("playurl refetch fail: " + ((r && r.error) || "?")); return; }
+						const el = getEl();
+						if (!el || getDisposed()) return;
+						const src2 = r.tk ? "/ambient-proxy?t=" + r.tk : "/ambient-proxy?url=" + encodeURIComponent(r.url);
+						log("new tk minted, src=" + src2.slice(0, 40) + "… resume pos=" + pos.toFixed(2));
+						el.src = src2;
+						let done = false;
+						const resumeOnce = () => {
+							if (done || getDisposed()) return;
+							done = true;
+							try { el.currentTime = pos; } catch (e) {}
+							doPlay();
+						};
+						el.addEventListener("loadedmetadata", resumeOnce, { once: true });
+						el.addEventListener("loadeddata", resumeOnce, { once: true });
+						setTo(() => { if (!done && !getDisposed() && el.readyState >= 1) resumeOnce(); }, 2500);
+						try { el.load(); } catch (e) {}
+					})
+					.catch((e) => log("refetch error: " + e));
+			};
+		}
+
 		function apply(ctx) {
 			const slots = ctx.slots;
 			const timer = ctx.timer;
@@ -65,6 +226,8 @@ window.__ModuleLoader__.load({
 				favFolders: [], favItems: [], favSel: "", favInfo: "", favBusy: false,
 				jfViews: [], jfItems: [], jfBusy: false, jfItemsInfo: "",
 			}, loadPersisted());
+			// B站VOD 播放上下文：断链自愈重铸 tk 时复用（bvid/page 来源与 playBiliVod 一致）
+			let biliPlayCtx = { bvid: "", page: 1 };
 			const listeners = new Set();
 			const getSnapshot = () => state;
 			const subscribe = (fn) => { listeners.add(fn); return () => { try { listeners.delete(fn) } catch (e) {} }; };
@@ -184,6 +347,7 @@ window.__ModuleLoader__.load({
 
 			// B站 VOD 原生播放（playurl 直链 + Host 代理转发 + loop 属性循环）
 			function playBiliVod(parsed) {
+				biliPlayCtx = { bvid: parsed.bvid, page: parsed.page || 1 };
 				setState({ src: "", site: "bili", native: true, nativeLoop: true, playing: true, nonce: state.nonce + 1, duration: 0, loopInfo: "B站VOD：正在获取直链…", error: "" });
 				fetch("/ambient-playurl?bvid=" + encodeURIComponent(parsed.bvid) + "&page=" + parsed.page).then((r) => r.json()).then((r) => {
 					if (!r || !r.ok) { setState({ playing: false, error: "B站直链获取失败（" + ((r && r.error) || "") + "）：可能被风控，稍后重试" }); return; }
@@ -269,7 +433,7 @@ window.__ModuleLoader__.load({
 				React.useEffect(() => {
 					const el = ref.current;
 					if (!el || !s.src) return;
-					let hls = null, flv = null, disposed = false;
+					let hls = null, flv = null, disposed = false, wd = null;
 					const doPlay = () => { try { const pr = el.play(); if (pr && pr.catch) pr.catch(() => { el.muted = true; el.play(); setState({ loopInfo: (s.loopInfo || "") + "（自动播放被拦，已静音续播）" }); }); } catch (e) { el.muted = true; el.play(); } };
 					if (s.site === "live" && s.liveFormat === "hls") {
 						ensureLib("hls").then((Hls) => {
@@ -294,12 +458,31 @@ window.__ModuleLoader__.load({
 					} else {
 						el.src = s.src;
 						doPlay();
+						// B站VOD 断链自愈看门狗：只对 /ambient-proxy 原生播放启用；
+						// 直播 hls/flv 走各自库的断流重连，本地/Jellyfin 不走此路径
+						if (s.site === "bili" && s.src.indexOf("/ambient-proxy") === 0) {
+							const healBiliVod = createBiliVodHealer({
+								getEl: () => el,
+								getCtx: () => biliPlayCtx,
+								doPlay,
+								getDisposed: () => disposed,
+								log: (...a) => console.log("[stall-heal]", ...a),
+							});
+							wd = createStallWatchdog({
+								getEl: () => ref.current,
+								onStall: (pos, attempt) => healBiliVod(pos, attempt),
+								onGiveUp: () => { try { setState({ error: "B站VOD播放中断，多次重铸令牌续播失败（网络或CDN问题），已停止" }); } catch (e) {} },
+								log: (...a) => console.log("[stall-heal]", ...a),
+							});
+							wd.attach(el);
+						}
 					}
 					const onErr = () => { setState({ error: "视频播放出错（可能编码不支持或网络问题）" }); };
 					el.addEventListener("error", onErr);
 					return () => {
 						disposed = true;
 						el.removeEventListener("error", onErr);
+						if (wd) { try { wd.dispose() } catch (e) {} }
 						if (hls) { try { hls.destroy() } catch (e) {} }
 						if (flv) { try { flv.destroy() } catch (e) {} }
 						try { el.pause(); el.removeAttribute("src"); el.load(); } catch (e) {}
@@ -1126,6 +1309,9 @@ s.uiOpen.fav ? React.createElement("div", null,
 
 		exports.apply = apply;
 		exports.inject = inject;
+		exports.createStallWatchdog = createStallWatchdog;
+		exports.createBiliVodHealer = createBiliVodHealer;
+		exports.STALL_MAX_RETRIES = STALL_MAX_RETRIES;
 		return module.exports;
 	}
 });
