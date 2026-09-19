@@ -1202,9 +1202,26 @@ print(json.dumps(out))\n')
     return { body, http, exit, err }
   }
 
+  // 同关键词搜索结果缓存（TTL 60s）：连搜同一词直接命中、不打上游，根治「成功后 26 秒再搜被 412」
+  const biliSearchCache = new Map()
+  const BILI_SEARCH_TTL = 60000
+  // 最近一次 bili 搜索的上游失败：null=成功/缓存命中；{kind:'ban'|'code'|'net', code} = 失败详情
+  let biliSearchFail = null
+
   async function searchBiliApiList(kw, limit) {
     if (!shell) return []
+    biliSearchFail = null
     const kwLog = sfield(kw)
+    const cacheKey = kw + '|1|20'
+    const hit = biliSearchCache.get(cacheKey)
+    if (hit) {
+      const age = Date.now() - hit.ts
+      if (age <= BILI_SEARCH_TTL) {
+        alog('search-bili', 'cache-hit kw=' + kwLog + ' n=' + hit.res.length + ' age=' + Math.round(age / 1000) + 's')
+        return hit.res.slice(0, limit)
+      }
+      biliSearchCache.delete(cacheKey)
+    }
     const q = await wbiSign({ search_type: 'video', keyword: kw, order: 'click', page: 1, ps: 20 })
     // -sS：错误进 stderr 不打扰 stdout；-w 把 HTTP 状态追加到 stdout 末尾（@@ST 标记后剥离，不污染 JSON）
     const cmd = 'curl -sS --max-time 10 ' +
@@ -1224,20 +1241,30 @@ print(json.dumps(out))\n')
     try { data = JSON.parse(o.body || '') } catch (e) {}
     const arr = data && data.code === 0 && data.data && Array.isArray(data.data.result) ? data.data.result : null
     alog('search-bili', 'kw=' + kwLog + ' exit=' + o.exit + ' http=' + o.http + ' bytes=' + o.body.length + ' code=' + (data ? String(data.code) : 'parse-fail') + ' n=' + (arr ? arr.length : -1))
-    if (arr == null) alog('search-bili', 'kw=' + kwLog + ' fail reason=' + (data ? 'upstream-code:' + String(data.code) : 'json-parse') + ' bytes=' + o.body.length + ' head80=' + o.body.slice(0, 80).replace(/\s+/g, ' ') + (o.err ? ' err=' + o.err : ''))
-    if (arr) {
-      return arr
-        .filter((x) => x && typeof x.bvid === 'string' && x.bvid)
-        .slice(0, limit)
-        .map((x) => ({
-          bvid: String(x.bvid),
-          title: stripHtml(x.title),
-          pic: String(x.pic || '').split('@')[0],
-          duration: parseDur(x.duration),
-          up: stripHtml(x.author),
-        }))
+    if (arr == null) {
+      alog('search-bili', 'kw=' + kwLog + ' fail reason=' + (data ? 'upstream-code:' + String(data.code) : 'json-parse') + ' bytes=' + o.body.length + ' head80=' + o.body.slice(0, 80).replace(/\s+/g, ' ') + (o.err ? ' err=' + o.err : ''))
+      const rawCode = data && data.code != null ? data.code : null
+      const d = rawCode != null ? String(rawCode).replace(/^-/, '') : (['412', '403', '429'].includes(String(o.http)) ? String(o.http) : '')
+      biliSearchFail = (d === '412' || d === '403' || d === '429')
+        ? { kind: 'ban', code: rawCode != null ? rawCode : Number(o.http) }
+        : (rawCode != null ? { kind: 'code', code: rawCode } : { kind: 'net', code: null, http: o.http })
+      return []
     }
-    return []
+    const res = arr
+      .filter((x) => x && typeof x.bvid === 'string' && x.bvid)
+      .map((x) => ({
+        bvid: String(x.bvid),
+        title: stripHtml(x.title),
+        pic: String(x.pic || '').split('@')[0],
+        duration: parseDur(x.duration),
+        up: stripHtml(x.author),
+      }))
+    biliSearchCache.set(cacheKey, { res: res, ts: Date.now() })
+    if (biliSearchCache.size > 100) {
+      const now = Date.now()
+      for (const [k, v] of biliSearchCache) { if (now - v.ts > BILI_SEARCH_TTL) biliSearchCache.delete(k) }
+    }
+    return res.slice(0, limit)
   }
 
   // 外网关键词搜索：返回多条（原 searchAnysearch 只取第一条就丢）
@@ -1272,7 +1299,22 @@ print(json.dumps(out))\n')
       const srcs = await searchAnysearchList(kw, n)
       cards = srcs.map((s) => ({ title: s.title, url: s.url, pic: '', duration: 0, up: '', reason: '' }))
     } else {
-      const items = await searchBiliApiList(kw, n)
+      // 对齐直接播路径的三级兜底：bili → anysearch → web（B站 412 时仍能出卡片）
+      let items = await searchBiliApiList(kw, n)
+      if (!items.length) {
+        alog('playsearch', 'M-fallback kw=' + sfield(kw) + ' step=anysearch reason=bili-empty')
+        items = (await searchAnysearchList('bilibili ' + kw, n))
+          .map((s) => {
+            const m = String(s.url || '').match(/bilibili\.com\/video\/(BV[0-9A-Za-z]+)/)
+            return m ? { bvid: m[1], title: s.title, pic: '', duration: 0, up: '' } : null
+          })
+          .filter(Boolean)
+      }
+      if (!items.length) {
+        alog('playsearch', 'M-fallback kw=' + sfield(kw) + ' step=web reason=anysearch-empty')
+        const picked = await tryWeb('bilibili ' + kw, 1500)
+        if (picked && picked.bvid) items = [{ bvid: picked.bvid, title: picked.title, pic: '', duration: 0, up: '' }]
+      }
       cards = items.map((it) => ({ title: it.title, bvid: it.bvid, pic: it.pic, duration: it.duration, up: it.up, reason: '' }))
     }
     if (!cards.length) return null
@@ -1498,8 +1540,17 @@ print(json.dumps(out))\n')
         if (mode === 'fav') return await aiFavRecommend(desc)
         if (mode === 'M') {
           const r = await multiSearchCards(desc, false)
-          if (!r) alog('playsearch', 'M-empty kw=' + sfield(desc) + ' reason=空结果(bili搜索无返回)')
-          return r || { kind: 'error', text: '没搜到国内视频结果（' + desc + '），换个关键词或直接 /playurl <链接>' }
+          if (!r) {
+            // 文案区分：风控 ≠ 上游报错 ≠ 真没搜到；code≠0 不再走「空结果」
+            const f = biliSearchFail
+            let reason = '空结果(三级兜底后仍无)', text = '没搜到国内视频结果（' + desc + '），换个关键词或直接 /playurl <链接>'
+            if (f && f.kind === 'ban') { reason = 'bili风控(code=' + f.code + ')'; text = 'B站风控（code=' + f.code + '），等一会儿再搜' }
+            else if (f && f.kind === 'code') { reason = 'bili错误(code=' + f.code + ')'; text = 'B站返回错误 code=' + f.code + '，等一会儿再搜' }
+            else if (f && f.kind === 'net') { reason = 'bili请求失败(http=' + f.http + ')' }
+            alog('playsearch', 'M-empty kw=' + sfield(desc) + ' reason=' + reason)
+            return { kind: 'error', text }
+          }
+          return r
         }
         const found = await withTimeout5(searchVideo(desc, 'domestic'))
         if (found && found.timeout) { alog('playsearch', 'timeout kw=' + sfield(desc) + ' reason=>5秒'); return { kind: 'error', text: '国内搜索超时（>5秒），请重试或直接 /playurl <链接>' } }
