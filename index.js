@@ -17,6 +17,9 @@ const MIME = {
   '.avi': 'video/x-msvideo', '.flv': 'video/x-flv',
 }
 
+// [ambient] 日志环形缓冲（≤200 条，丢最旧），供 /ambient-log 聊天内查询
+const logBuf = []
+
 function apply(ctx) {
   const commands = ctx.get('commands')
   const webServer = ctx.get('webServer')
@@ -42,7 +45,7 @@ function apply(ctx) {
   const R = (p) => path.resolve(p)
   const esc = (p) => JSON.stringify(String(p)) // 拼 shell 参数的 JSON 字面量（安全）
   // 请求级日志（单行 ≤200B，禁止逐字节）：时间 + 路由 + 字段串
-  const alog = (route, fields) => { try { console.log(('[ambient] ' + new Date().toISOString() + ' ' + route + ' ' + fields).slice(0, 300)) } catch (e) {} }
+  const alog = (route, fields) => { try { const line = ('[ambient] ' + new Date().toISOString() + ' ' + route + ' ' + fields).slice(0, 300); console.log(line); logBuf.push(line); if (logBuf.length > 200) logBuf.splice(0, logBuf.length - 200) } catch (e) {} }
   // 搜索日志用：关键词/query 压空白并截断
   const sfield = (s) => String(s || '').replace(/\s+/g, '_').slice(0, 40)
 
@@ -1592,6 +1595,53 @@ print(json.dumps(out))\n')
       },
     })
     ctx.effect(() => offSearchW)
+
+    // ---- /ambient-log：聊天内查 [ambient] 日志（缓冲见模块级 logBuf）----
+    const LOG_FILTERS = {
+      '搜索': ['search-bili', 'search-any', 'search-web', 'playsearch'],
+      'search': ['search-bili', 'search-any', 'search-web', 'playsearch'],
+      '播放': ['/ambient-playurl', '/ambient-proxy'],
+      'play': ['/ambient-playurl', '/ambient-proxy'],
+    }
+    const LOG_USAGE = '用法：/ambient-log（最近20条）| 搜索 | 播放 | 全部（最近50条）| 清（清空缓冲）'
+    const ambientLogHandler = async (invocation) => {
+      const raw = String(invocation.rawInput || '').trim()
+      if (raw === '清' || raw.toLowerCase() === 'clear') { logBuf.length = 0; return { kind: 'success', text: '日志缓冲已清空' } }
+      const filter = raw ? LOG_FILTERS[raw.toLowerCase()] : null
+      if (raw && !filter && raw !== '全部') return { kind: 'error', text: LOG_USAGE }
+      let lines = logBuf
+      if (!raw) lines = logBuf.slice(-20)
+      else if (raw === '全部') lines = logBuf.slice(-50)
+      else lines = logBuf.filter((l) => filter.some((k) => l.includes(k)))
+      const trunc = lines.map((l) => l.slice(0, 200))
+      const stat = '缓冲 ' + logBuf.length + '/200 条'
+      const out = []
+      let total = 4000 - stat.length - 90 // 预留统计行与截断注明行
+      for (let i = trunc.length - 1; i >= 0; i--) {
+        if (total - trunc[i].length - 1 < 0) break
+        total -= trunc[i].length + 1
+        out.unshift(trunc[i])
+      }
+      if (!out.length) return { kind: 'success', text: (trunc.length ? '日志过长无法展示' : '暂无日志') + '（' + stat + '）' }
+      let text = out.join('\n')
+      if (out.length < trunc.length) text += '\n已截断，最早一条为：' + trunc[0].slice(0, 60)
+      return { kind: 'success', text: text + '\n' + stat }
+    }
+    const offAmbientLog = commands.register({
+      name: 'ambient-log',
+      description: '查看插件运行日志：/ambient-log [搜索|播放|全部|清]',
+      input: { hint: '[搜索|播放|全部|清]' },
+      handler: ambientLogHandler,
+    })
+    ctx.effect(() => offAmbientLog)
+
+    const offALog = commands.register({
+      name: 'alog',
+      description: '/ambient-log 别名：/alog [搜索|播放|全部|清]',
+      input: { hint: '[搜索|播放|全部|清]' },
+      handler: ambientLogHandler,
+    })
+    ctx.effect(() => offALog)
 
   }
 }

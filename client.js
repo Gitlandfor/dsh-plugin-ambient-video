@@ -304,11 +304,31 @@ window.__ModuleLoader__.load({
 				duration: 0, loopInfo: "", error: "",
 				native: false, nativeLoop: false, liveFormat: "", probe: "",
 				dirPath: "", dirEntries: null, dirError: "",
+				healEvents: [],
 				favFolders: [], favItems: [], favSel: "", favInfo: "", favBusy: false,
 				jfViews: [], jfItems: [], jfBusy: false, jfItemsInfo: "",
 			}, loadPersisted());
 			// B站VOD 播放上下文：断链自愈重铸 tk 时复用（bvid/page 来源与 playBiliVod 一致）
 			let biliPlayCtx = { bvid: "", page: 1 };
+			// [stall-heal] 日志：console.log 照旧，另记最近 5 条事件（仅内存）供设置面板显示
+			const healLog = (...a) => {
+				console.log("[stall-heal]", ...a);
+				try {
+					const m = String(a[0] || "");
+					let type = "";
+					if (/^HEAL /.test(m)) type = "HEAL(" + m.split(" ")[1] + ")";
+					else if (/^GIVE-UP /.test(m)) type = "GIVE-UP(" + m.split(" ")[1] + ")";
+					else if (/^media-error/.test(m)) type = "media-error";
+					else if (/^seek-ok/.test(m)) type = "seek-ok";
+					else if (/^seek-giveup/.test(m)) type = "seek-giveup";
+					if (!type) return;
+					const posm = m.match(/pos=([\d.]+)/) || m.match(/currentTime=([\d.]+)/);
+					const attm = m.match(/attempt=([\d/]+)/) || m.match(/tries=(\d+)/) || m.match(/retries=(\d+)\//);
+					const ev = { t: Date.now(), type, pos: posm ? Math.round(Number(posm[1])) + "s" : "-", attempt: attm ? attm[1] : "-" };
+					setState({ healEvents: [ev].concat(state.healEvents || []).slice(0, 5) });
+				} catch (e) {}
+			};
+			const fmtClock = (t) => { const d = new Date(t); const p2 = (n) => (n < 10 ? "0" : "") + n; return p2(d.getMinutes()) + ":" + p2(d.getSeconds()) };
 			const listeners = new Set();
 			const getSnapshot = () => state;
 			const subscribe = (fn) => { listeners.add(fn); return () => { try { listeners.delete(fn) } catch (e) {} }; };
@@ -547,13 +567,13 @@ window.__ModuleLoader__.load({
 								getCtx: () => biliPlayCtx,
 								doPlay,
 								getDisposed: () => disposed,
-								log: (...a) => console.log("[stall-heal]", ...a),
+								log: healLog,
 							});
 							wd = createStallWatchdog({
 								getEl: () => ref.current,
 								onStall: (pos, attempt, finish) => healBiliVod(pos, attempt, finish),
 								onGiveUp: () => { try { setState({ error: "B站VOD播放中断，多次重铸令牌续播失败（网络或CDN问题），已停止" }); } catch (e) {} },
-								log: (...a) => console.log("[stall-heal]", ...a),
+								log: healLog,
 							});
 							wd.attach(el);
 						}
@@ -1354,6 +1374,13 @@ s.uiOpen.fav ? React.createElement("div", null,
 
 					// ---- 显示/循环选项 ----
 ) : null,
+					React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 2, border: "0.5px solid var(--dsw-alias-border-l3)", borderRadius: 8, padding: 6 } },
+						React.createElement("div", { style: { fontSize: 12, fontWeight: 600, color: "var(--dsw-alias-label-primary)" } }, "🧯 最近自愈事件"),
+						s.healEvents && s.healEvents.length
+							? s.healEvents.map((e, i) => React.createElement("div", { key: e.t + "-" + i, style: { fontSize: 12, color: "var(--dsw-alias-label-secondary)", fontFamily: "var(--ds-font-family-code, monospace)", overflowWrap: "anywhere" } },
+								fmtClock(e.t) + " " + e.type + " pos=" + e.pos + " attempt=" + e.attempt))
+							: React.createElement("div", { style: { fontSize: 12, color: "var(--dsw-alias-label-secondary)" } }, "暂无")
+					),
 					s.error ? React.createElement("div", { style: { color: "var(--dsw-alias-state-error-primary)", fontSize: 12 } }, s.error) : null
 				);
 			}
