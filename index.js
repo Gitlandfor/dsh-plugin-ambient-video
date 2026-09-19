@@ -54,6 +54,38 @@ function apply(ctx) {
     const r = await shell.run(spec)
     try { return JSON.parse(r && r.stdout ? (r.stdout.text || '') : '') } catch (e) { return null }
   }
+  // 直连 Node https 拉 JSON：流式读满整个 body，无长度上限。
+  // 不走 web.fetch——宿主 dsh-web-fetch-http 有 maxBodyChars 默认 1e5 的头部截断
+  // （lib/index.js:527-528 `decoded.slice(0, maxBodyChars)`），view/playurl 大响应会被切成
+  // 100000 字符 → JSON.parse "Unterminated string at position 100000"；也不走子进程 curl（stdout 同样有界）。
+  function httpsGetText(url, headers, redirects) {
+    return new Promise((resolve, reject) => {
+      const req = https.get(url, { headers: { 'User-Agent': UA, Referer: 'https://www.bilibili.com/', ...(headers || {}) }, timeout: 12000 }, (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && (redirects || 0) < 3) {
+          res.resume()
+          let next = ''
+          try { next = new URL(res.headers.location, url).toString() } catch (e) { reject(new Error('bad-redirect')); return }
+          httpsGetText(next, headers, (redirects || 0) + 1).then(resolve, reject)
+          return
+        }
+        if (res.statusCode !== 200) { res.resume(); reject(new Error('http-' + res.statusCode)); return }
+        const chunks = []
+        let bytes = 0
+        res.on('data', (c) => { chunks.push(c); bytes += c.length })
+        res.on('end', () => resolve({ text: Buffer.concat(chunks).toString('utf8'), bytes }))
+        res.on('error', reject)
+      })
+      req.on('timeout', () => { req.destroy(new Error('timeout')) })
+      req.on('error', reject)
+    })
+  }
+  // JSON.parse 失败时补可观测：实际字节数 + 响应前 80 字符（然后照原样抛出，交给外层既有 catch）
+  const parseBili = (label, r) => {
+    try { return JSON.parse(r.text) } catch (e) {
+      alog('/ambient-playurl', label + '-parse-fail bytes=' + r.bytes + ' head80=' + r.text.slice(0, 80).replace(/\s+/g, ' '))
+      throw e
+    }
+  }
   // wbi 签名（bilibili-API-collect 标准算法）
   const WBI_TABLE = [46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,37,48,7,16,24,55,40,61,26,17,0,1,60,51,30,4,22,25,54,21,56,59,6,63,57,62,11,36,20,34,44,52]
   async function wbiKey() {
@@ -573,17 +605,23 @@ function apply(ctx) {
             json(res, { ok: true, url: playurlCache.url, tk, duration: playurlCache.duration, title: playurlCache.title, pic: playurlCache.pic || '', cached: true })
             return
           }
-          if (!shell) { fail('no-shell'); return }
-          // view API 拿 cid（与 /ambient-info 同款：web/curl 双源）
-          const viewUrl = 'https://api.bilibili.com/x/web-interface/view?bvid=' + encodeURIComponent(bvid)
-          let vText = ''
-          if (web) { try { const r = await web.fetch({ url: viewUrl }); vText = r && r.body ? String(r.body.content || '') : '' } catch (e) { vText = '' } }
-          if (!vText) {
-            const vSpec = shell.resolve({ command: 'curl -s --max-time 12 ' + JSON.stringify(viewUrl), timeoutMs: 15000, stdoutMaxBytes: 524288 })
-            const vr = await shell.run(vSpec)
-            if (vr && vr.stdout) vText = vr.stdout.text || ''
+          // 完整浏览器特征头：B站 WAF 对裸请求会 429（与 search/fav 侧同款铁律）
+          const biliHdr = {
+            'User-Agent': UA,
+            Referer: 'https://www.bilibili.com/',
+            'sec-ch-ua': '"Chromium";v="126", "Google Chrome";v="126", "Not.A/Brand";v="24"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Linux"',
+            'sec-fetch-site': 'same-site',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-user': '?1',
+            'sec-fetch-platform': '"Linux"',
+            Accept: 'application/json, text/plain, */*',
           }
-          const vd = JSON.parse(vText)
+          // view API 拿 cid：直连 https 流式读满（web.fetch 会 100000 字符截断，见 httpsGetText 注释）
+          const viewUrl = 'https://api.bilibili.com/x/web-interface/view?bvid=' + encodeURIComponent(bvid)
+          const vd = parseBili('view', await httpsGetText(viewUrl, biliHdr))
           if (!vd || vd.code !== 0 || !vd.data) { fail('view-api:' + String(vd && vd.code)); return }
           let cid = Number(vd.data.cid) || 0
           if (page > 1 && Array.isArray(vd.data.pages)) {
@@ -591,11 +629,9 @@ function apply(ctx) {
             if (pg && Number(pg.cid)) cid = Number(pg.cid)
           }
           if (!cid) { fail('no-cid'); return }
-          // playurl API fnval=1 拿 durl mp4 直链；qn=32(480P) 匿名即可
+          // playurl API fnval=1 拿 durl mp4 直链；qn=16 匿名即可（头与参数与原 curl 路径一致）
           const puUrl = 'https://api.bilibili.com/x/player/playurl?bvid=' + encodeURIComponent(bvid) + '&cid=' + cid + '&qn=16&fnval=1&fnver=0'
-          const puSpec = shell.resolve({ command: 'curl -s --max-time 12 -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36" -H "Referer: https://www.bilibili.com/" ' + JSON.stringify(puUrl), timeoutMs: 15000, stdoutMaxBytes: 2097152 })
-          const pur = await shell.run(puSpec)
-          const pd = JSON.parse(pur && pur.stdout ? (pur.stdout.text || '{}') : '{}')
+          const pd = parseBili('playurl', await httpsGetText(puUrl, biliHdr))
           if (!pd || pd.code !== 0 || !pd.data || !pd.data.durl || !pd.data.durl.length) { fail('playurl-api:' + String(pd && pd.code)); return }
           const url = String(pd.data.durl[0].url || '')
           if (!url) { fail('no-durl'); return }
