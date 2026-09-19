@@ -763,7 +763,8 @@ window.__ModuleLoader__.load({
 			// 按住卡片拖动：位移欧氏距离 > DRAG_PLAY_PX 松手即播，未达阈值回弹（原 HTML5 拖拽链路已移除）
 			const DRAG_PLAY_PX = 60;
 			let suppressClickUntil = 0;   // 拖拽结束后短窗口内吞掉冒泡到根节点的 click，防误关浮层
-			function HsCardEl(c, i, onZone) {
+			let dragActive = false;       // 拖拽期间冻结悬停切换，避免邻卡抖动
+			function HsCardEl(c, i, onZone, hoverIdx, setHoverIdx) {
 				const x = Number(c.duration) || 0;
 				const rarity = x > 3000 ? "#ff8000" : x > 1800 ? "#a335ee" : x > 900 ? "#3d6ad6" : "#9a9a9a";
 				const payload = c.raw || c.bvid || c.url || "";
@@ -772,6 +773,7 @@ window.__ModuleLoader__.load({
 				function onDown(e) {
 					if (e.button != null && e.button !== 0) return;
 					const t = e.currentTarget;
+					dragActive = true;
 					const r = t.getBoundingClientRect();
 					const g = t.cloneNode(true);
 					g.style.position = "fixed";
@@ -806,6 +808,8 @@ window.__ModuleLoader__.load({
 					if (!d) return;
 					t._drag = null;
 					t.style.opacity = "";
+					dragActive = false;
+					if (setHoverIdx) setHoverIdx(-1);
 					suppressClickUntil = Date.now() + 400;
 					const dist = Math.sqrt(d.dx * d.dx + d.dy * d.dy);
 					if (onZone) onZone(false);
@@ -821,13 +825,28 @@ window.__ModuleLoader__.load({
 						setTimeout(() => { try { g.remove(); } catch (err) {} }, 200);
 					}
 				}
+				// 扇形牌堆：悬停卡上移放大提到最上层，紧邻前后各两张水平外推拨开
+				let transform = "none";
+				let zIndex = i + 1;
+				let boxShadow = "0 6px 18px rgba(0,0,0,.55)";
+				if (hoverIdx === i) {
+					transform = "translateY(-26px) scale(1.22)";
+					zIndex = 100;
+					boxShadow = "0 18px 40px rgba(0,0,0,.8)";
+				} else if (hoverIdx >= 0) {
+					const dd = i - hoverIdx;
+					const ad = dd < 0 ? -dd : dd;
+					if (ad === 1 || ad === 2) transform = "translateX(" + (dd > 0 ? (ad === 1 ? 18 : 22) : -(ad === 1 ? 18 : 22)) + "px)";
+				}
 				return React.createElement("div", {
 					key: c.bvid || i,
 					onPointerDown: onDown,
 					onPointerMove: onMove,
 					onPointerUp: onUp,
 					onPointerCancel: onUp,
-					style: { width: 172, height: 229, borderRadius: 10, background: "linear-gradient(#2a2a3a,#16161f)", cursor: "grab", position: "relative", overflow: "hidden", flex: "none", flexShrink: 0, boxSizing: "border-box", boxShadow: "0 6px 18px rgba(0,0,0,.55)", border: "3px solid " + rarity, touchAction: "none", userSelect: "none", WebkitUserSelect: "none" },
+					onPointerEnter: () => { if (dragActive) return; if (setHoverIdx) setHoverIdx(i); },
+					onPointerLeave: () => { if (dragActive) return; if (setHoverIdx) setHoverIdx(-1); },
+					style: { width: 172, height: 229, borderRadius: 10, background: "linear-gradient(#2a2a3a,#16161f)", cursor: "grab", position: "relative", zIndex: zIndex, overflow: "hidden", flex: "none", flexShrink: 0, boxSizing: "border-box", boxShadow: boxShadow, border: "3px solid " + rarity, touchAction: "none", userSelect: "none", WebkitUserSelect: "none", transform: transform, transition: "transform .18s ease, box-shadow .18s ease" },
 				},
 					c.pic ? React.createElement("img", { src: c.pic, alt: "", draggable: false, referrerPolicy: "no-referrer", onError: (e) => { e.currentTarget.style.display = "none"; }, style: { width: "100%", height: 128, objectFit: "cover", display: "block", pointerEvents: "none" } }) : React.createElement("div", { style: { height: 128, display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center", padding: 10, boxSizing: "border-box", fontSize: 11, color: "#8a8a9a", lineHeight: 1.3 } }, "无封面"),
 					x > 0 ? React.createElement("div", { style: { position: "absolute", top: 6, left: 6, background: "#1b3a8a", borderRadius: 999, padding: "2px 8px", color: "#fff", fontSize: 11, fontWeight: 600 } }, fmtDuration(x)) : null,
@@ -841,6 +860,7 @@ window.__ModuleLoader__.load({
 				const [cards, setCards] = React.useState(OV.cards);
 				const [source, setSource] = React.useState(OV.source);
 				const [dragOver, setDragOver] = React.useState(false);
+				const [hoverIdx, setHoverIdx] = React.useState(-1);
 				const unsub = React.useRef(null);
 				const seenSeq = React.useRef(OV.seq);
 				React.useEffect(() => {
@@ -894,8 +914,11 @@ window.__ModuleLoader__.load({
 					),
 					React.createElement("div", {
 						onClick: (e) => e.stopPropagation(),
-						style: { position: "absolute", bottom: 22, left: 0, right: 0, display: "flex", gap: 16, justifyContent: "flex-start", alignItems: "center", flexWrap: "nowrap", overflowX: "auto", overflowY: "hidden", WebkitOverflowScrolling: "touch", padding: "6px 20px", boxSizing: "border-box", maxHeight: 241, backgroundImage: "linear-gradient(to right, rgba(6,6,12,.84) 32%, rgba(6,6,12,0)), linear-gradient(to left, rgba(6,6,12,.84) 32%, rgba(6,6,12,0)), radial-gradient(farthest-side at 0 50%, rgba(0,0,0,.55), rgba(0,0,0,0)), radial-gradient(farthest-side at 100% 50%, rgba(0,0,0,.55), rgba(0,0,0,0))", backgroundRepeat: "no-repeat", backgroundSize: "44px 100%, 44px 100%, 16px 100%, 16px 100%", backgroundPosition: "0 0, 100% 0, 0 0, 100% 0", backgroundAttachment: "local, local, scroll, scroll" }
-					}, cards.map((c, k) => HsCardEl(c, k, setDragOver)))
+						style: { position: "absolute", bottom: 22, left: 0, right: 0, display: "flex", gap: 0, justifyContent: "center", alignItems: "center", flexWrap: "nowrap", overflow: "visible", padding: "6px 20px", boxSizing: "border-box", maxHeight: 241 }
+					}, cards.map((c, k) => React.createElement("div", {
+						key: "slot-" + (c.bvid || k),
+						style: { flex: "1 1 0", minWidth: 0, display: "flex", justifyContent: "center", overflow: "visible" }
+					}, HsCardEl(c, k, setDragOver, hoverIdx, setHoverIdx))))
 				);
 			}
 
