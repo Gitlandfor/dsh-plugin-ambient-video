@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-ambient-video",
-  "version": "1.4.5",
+  "version": "1.4.6",
   "description": "氛围背景视频（DSH Ambient Background Video）：Bilibili/YouTube/本地视频/直播(B站+Twitch)/Jellyfin + B站收藏AI推荐；原生<video> + 全屏嵌入 + 炉石风拖拽卡片 + 流式AI理由 + 播放历史；命令 /playurl /playsearch [AI 描述] /playsearchw [AI 描述] /playhistory /playstop",
   "type": "module",
   "main": "index.js",

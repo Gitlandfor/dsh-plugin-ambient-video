@@ -42,7 +42,9 @@ function apply(ctx) {
   const R = (p) => path.resolve(p)
   const esc = (p) => JSON.stringify(String(p)) // 拼 shell 参数的 JSON 字面量（安全）
   // 请求级日志（单行 ≤200B，禁止逐字节）：时间 + 路由 + 字段串
-  const alog = (route, fields) => { try { console.log(('[ambient] ' + new Date().toISOString() + ' ' + route + ' ' + fields).slice(0, 200)) } catch (e) {} }
+  const alog = (route, fields) => { try { console.log(('[ambient] ' + new Date().toISOString() + ' ' + route + ' ' + fields).slice(0, 300)) } catch (e) {} }
+  // 搜索日志用：关键词/query 压空白并截断
+  const sfield = (s) => String(s || '').replace(/\s+/g, '_').slice(0, 40)
 
   // ---- B站收藏辅助（curlJson / wbi 签名；供 /ambient-fav/* 路由与 /playask 共用）----
   const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36'
@@ -1189,52 +1191,76 @@ print(json.dumps(out))\n')
   //   2) 光有 UA + Referer 不够，会被 412 拦；必须补全浏览器请求头
   //      （Accept / Accept-Language / Origin / Sec-Fetch-*）。收藏接口不挑，搜索接口挑。
   // 原 searchBiliApi 两项都没做，国内关键词搜索一直是坏的。
+  // 从 shell.run 结果剥离 curl -w 追加的 "\n@@ST<http_code>"，返回 { body, http, exit, err }
+  function curlOut(r) {
+    const out = (r && r.stdout && r.stdout.text) || ''
+    let body = out, http = '-'
+    const tag = out.lastIndexOf('\n@@ST')
+    if (tag >= 0) { body = out.slice(0, tag); http = out.slice(tag + 5, tag + 8) }
+    const exit = r ? (r.exitCode != null ? r.exitCode : (r.code != null ? r.code : (r.status != null ? r.status : '?'))) : '?'
+    const err = r && r.stderr && r.stderr.text ? String(r.stderr.text).replace(/\s+/g, '_').slice(0, 40) : ''
+    return { body, http, exit, err }
+  }
+
   async function searchBiliApiList(kw, limit) {
     if (!shell) return []
+    const kwLog = sfield(kw)
     const q = await wbiSign({ search_type: 'video', keyword: kw, order: 'click', page: 1, ps: 20 })
-    const cmd = 'curl -s --max-time 10 ' +
+    // -sS：错误进 stderr 不打扰 stdout；-w 把 HTTP 状态追加到 stdout 末尾（@@ST 标记后剥离，不污染 JSON）
+    const cmd = 'curl -sS --max-time 10 ' +
       '-H "User-Agent: ' + BILI_UA + '" ' +
       '-H "Referer: https://www.bilibili.com/" ' +
       '-H "Accept: application/json, text/plain, */*" ' +
       '-H "Accept-Language: zh-CN,zh;q=0.9" ' +
       '-H "Origin: https://www.bilibili.com" ' +
       '-H "Sec-Fetch-Dest: empty" -H "Sec-Fetch-Mode: cors" -H "Sec-Fetch-Site: same-origin" ' +
+      '-w "\\n@@ST%{http_code}" ' +
       '"https://api.bilibili.com/x/web-interface/search/type?' + q + '"'
+    alog('search-bili', 'req kw=' + kwLog + ' page=1 ps=20')
     const spec = shell.resolve({ command: cmd, timeoutMs: 16000, stdoutMaxBytes: 1048576 })
     const r = await shell.run(spec)
-    try {
-      const data = JSON.parse(r && r.stdout ? (r.stdout.text || '') : '')
-      if (data && data.code === 0 && data.data && Array.isArray(data.data.result)) {
-        return data.data.result
-          .filter((x) => x && typeof x.bvid === 'string' && x.bvid)
-          .slice(0, limit)
-          .map((x) => ({
-            bvid: String(x.bvid),
-            title: stripHtml(x.title),
-            pic: String(x.pic || '').split('@')[0],
-            duration: parseDur(x.duration),
-            up: stripHtml(x.author),
-          }))
-      }
-    } catch (e) {}
+    const o = curlOut(r)
+    let data = null
+    try { data = JSON.parse(o.body || '') } catch (e) {}
+    const arr = data && data.code === 0 && data.data && Array.isArray(data.data.result) ? data.data.result : null
+    alog('search-bili', 'kw=' + kwLog + ' exit=' + o.exit + ' http=' + o.http + ' bytes=' + o.body.length + ' code=' + (data ? String(data.code) : 'parse-fail') + ' n=' + (arr ? arr.length : -1))
+    if (arr == null) alog('search-bili', 'kw=' + kwLog + ' fail reason=' + (data ? 'upstream-code:' + String(data.code) : 'json-parse') + ' bytes=' + o.body.length + ' head80=' + o.body.slice(0, 80).replace(/\s+/g, ' ') + (o.err ? ' err=' + o.err : ''))
+    if (arr) {
+      return arr
+        .filter((x) => x && typeof x.bvid === 'string' && x.bvid)
+        .slice(0, limit)
+        .map((x) => ({
+          bvid: String(x.bvid),
+          title: stripHtml(x.title),
+          pic: String(x.pic || '').split('@')[0],
+          duration: parseDur(x.duration),
+          up: stripHtml(x.author),
+        }))
+    }
     return []
   }
 
   // 外网关键词搜索：返回多条（原 searchAnysearch 只取第一条就丢）
   async function searchAnysearchList(query, limit) {
     if (!shell) return []
+    const qLog = sfield(query)
     try {
       const body = JSON.stringify({ query, max_results: 10 })
       const proxyArg = searchProxy ? " -x " + JSON.stringify(searchProxy) : ''
-      const cmd = "curl -s --max-time 12" + proxyArg + " -X POST https://api.anysearch.com/v1/search -H \"content-type: application/json\" -d '" + body + "'"
+      const cmd = "curl -sS --max-time 12" + proxyArg + " -X POST https://api.anysearch.com/v1/search -H \"content-type: application/json\" -d '" + body + "' -w '\\n@@ST%{http_code}'"
       const spec = shell.resolve({ command: cmd, timeoutMs: 20000, stdoutMaxBytes: 262144 })
       const r = await shell.run(spec)
-      const data = JSON.parse(r && r.stdout ? (r.stdout.text || '') : '')
+      const o = curlOut(r)
+      let data = null
+      try { data = JSON.parse(o.body || '') } catch (e) {}
       const results = data && data.data && Array.isArray(data.data.results) ? data.data.results : []
+      alog('search-any', 'q=' + qLog + ' exit=' + o.exit + ' http=' + o.http + ' bytes=' + o.body.length + ' n=' + results.length + (data ? '' : ' reason=json-parse'))
       return results.slice(0, limit)
         .map((it) => ({ title: stripHtml(it.title), url: String(it.url || '') }))
         .filter((x) => x.title && x.url)
-    } catch (e) {}
+    } catch (e) {
+      alog('search-any', 'q=' + qLog + ' fail reason=throw:' + String(e && e.message || e).replace(/\s+/g, '_').slice(0, 40))
+    }
     return []
   }
 
@@ -1297,15 +1323,19 @@ print(json.dumps(out))\n')
   }
   const tryWeb = async (q, ms) => {
     if (!web) return null
+    const qLog = sfield(q)
+    alog('search-web', 'fallback q=' + qLog + ' ms=' + (ms || 4000))
     let timer = null
     try {
       const res = await Promise.race([
         web.search({ query: q, maxResults: 10 }),
         new Promise((resolve) => { timer = setTimeout(() => resolve(null), ms || 4000) }),
       ])
-      if (!res) return null
-      return pickResult(res && res.sources ? res.sources : [])
-    } catch (e) { return null } finally { if (timer) clearTimeout(timer) }
+      if (!res) { alog('search-web', 'q=' + qLog + ' result=timeout/null'); return null }
+      const picked = pickResult(res && res.sources ? res.sources : [])
+      alog('search-web', 'q=' + qLog + ' sources=' + (res.sources ? res.sources.length : 0) + ' picked=' + (picked ? picked.site : 'null'))
+      return picked
+    } catch (e) { alog('search-web', 'q=' + qLog + ' fail reason=throw:' + String(e && e.message || e).replace(/\s+/g, '_').slice(0, 60)); return null } finally { if (timer) clearTimeout(timer) }
   }
   async function searchVideo(kw, mode) {
     if (mode === 'domestic') {
@@ -1468,11 +1498,12 @@ print(json.dumps(out))\n')
         if (mode === 'fav') return await aiFavRecommend(desc)
         if (mode === 'M') {
           const r = await multiSearchCards(desc, false)
+          if (!r) alog('playsearch', 'M-empty kw=' + sfield(desc) + ' reason=空结果(bili搜索无返回)')
           return r || { kind: 'error', text: '没搜到国内视频结果（' + desc + '），换个关键词或直接 /playurl <链接>' }
         }
         const found = await withTimeout5(searchVideo(desc, 'domestic'))
-        if (found && found.timeout) return { kind: 'error', text: '国内搜索超时（>5秒），请重试或直接 /playurl <链接>' }
-        if (!found) return { kind: 'error', text: '没搜到国内视频结果（' + desc + '），换个关键词或直接 /playurl <链接>' }
+        if (found && found.timeout) { alog('playsearch', 'timeout kw=' + sfield(desc) + ' reason=>5秒'); return { kind: 'error', text: '国内搜索超时（>5秒），请重试或直接 /playurl <链接>' } }
+        if (!found) { alog('playsearch', 'all-empty kw=' + sfield(desc) + ' reason=bili+anysearch+web全部失败'); return { kind: 'error', text: '没搜到国内视频结果（' + desc + '），换个关键词或直接 /playurl <链接>' } }
         await delay()
         const label = found.site === 'yt' ? ('yt:' + found.vid) : found.bvid
         return { kind: 'success', text: '已搜索到：' + (found.title || '搜索结果') + '（' + label + '）' }
