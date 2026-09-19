@@ -738,7 +738,7 @@ print(json.dumps(out))\n')
     ctx.effect(() => offLocal)
 
     // ---- B站 VOD 直链解析 ?bvid= &page= [&seg=] → {url: durl mp4 直链, duration, title, segIndex, segCount}（fnval=1 老式 durl，480P 匿名可拿）----
-    let playurlCache = { at: 0, key: '', url: '', segs: [], duration: 0, title: '', streamDur: 0, preview: false, auth: 'anon' }
+    let playurlCache = { at: 0, key: '', url: '', segs: [], duration: 0, totalDuration: 0, pageCount: 1, pageIndex: 1, title: '', streamDur: 0, preview: false, auth: 'anon' }
     // 播放令牌：直链由 /ambient-playurl 铸造，浏览器只拿 token 不拿 URL
     // （原 ?url= 白名单只含 bilivideo/bilibili/hdslb，B站第三方 CDN 如 mountaintoys.cn 会被 403；
     //  且客户端传 URL 有 SSRF 面。token 由 Host 自己签，代理查表取链，天然安全且不限 CDN）
@@ -760,8 +760,8 @@ print(json.dumps(out))\n')
           if (playurlCache.key === key && Date.now() - playurlCache.at < 15000 && Array.isArray(playurlCache.segs) && seg < playurlCache.segs.length) {
             const segs = playurlCache.segs
             const tk = mint(segs[seg])
-            alog('/ambient-playurl', 'tk=' + tk.slice(0, 12) + ' bvid=' + bvid + ' seg=' + seg + ' status=200 reason=ok cached=1 segCount=' + segs.length + ' auth=' + (playurlCache.auth || 'anon') + ' streamDur=' + (playurlCache.streamDur || 0) + ' preview=' + (playurlCache.preview ? 1 : 0))
-            json(res, { ok: true, url: segs[seg], tk, duration: playurlCache.duration, title: playurlCache.title, pic: playurlCache.pic || '', cached: true, segIndex: seg, segCount: segs.length, preview: !!playurlCache.preview, streamDur: playurlCache.streamDur || 0 })
+            alog('/ambient-playurl', 'tk=' + tk.slice(0, 12) + ' bvid=' + bvid + ' seg=' + seg + ' status=200 reason=ok cached=1 segCount=' + segs.length + ' auth=' + (playurlCache.auth || 'anon') + ' streamDur=' + (playurlCache.streamDur || 0) + ' preview=' + (playurlCache.preview ? 1 : 0) + ' page=' + (playurlCache.pageIndex || page) + ' pageCount=' + (playurlCache.pageCount || 1))
+            json(res, { ok: true, url: segs[seg], tk, duration: playurlCache.duration, title: playurlCache.title, pic: playurlCache.pic || '', cached: true, segIndex: seg, segCount: segs.length, preview: !!playurlCache.preview, streamDur: playurlCache.streamDur || 0, pageCount: playurlCache.pageCount || 1, pageIndex: playurlCache.pageIndex || page, totalDuration: playurlCache.totalDuration || playurlCache.duration || 0 })
             return
           }
           // 完整浏览器特征头：B站 WAF 对裸请求会 429（与 search/fav 侧同款铁律）
@@ -794,11 +794,12 @@ print(json.dumps(out))\n')
             const hdr = biliHdr()
             const vd = parseBili('view', await httpsGetText(viewUrl, hdr))
             if (!vd || vd.code !== 0 || !vd.data) return { fail: 'view-api:' + String(vd && vd.code) }
+            const pages = Array.isArray(vd.data.pages) ? vd.data.pages : []
+            const pageCount = pages.length || 1
+            // 当前 page 那条；找不到（page 越界 / 老数据无 pages）退化用 pages[0]
+            const pg = pages.find((x) => Number(x.page) === page) || pages[0]
             let cid = Number(vd.data.cid) || 0
-            if (page > 1 && Array.isArray(vd.data.pages)) {
-              const pg = vd.data.pages.find((x) => Number(x.page) === page)
-              if (pg && Number(pg.cid)) cid = Number(pg.cid)
-            }
+            if (page > 1 && pg && Number(pg.cid)) cid = Number(pg.cid)
             if (!cid) return { fail: 'no-cid' }
             const pd = parseBili('playurl', await httpsGetText(playurlOf(cid), hdr))
             if (!pd || pd.code !== 0 || !pd.data) return { fail: 'playurl-api:' + String(pd && pd.code), pcode: Number(pd && pd.code) }
@@ -807,13 +808,17 @@ print(json.dumps(out))\n')
             // 第 1 段播完时静默结束。这里整表缓存，seg 由客户端播到下一段时现铸（CDN 直链有时效，预铸会囤过期链）
             const segs = pd.data.durl.map((d) => String((d && d.url) || '')).filter(Boolean)
             if (!segs.length) return { fail: 'no-durl' }
-            const duration = Number(vd.data.duration) || 0
+            // 对外 duration 必须是「当前 P」的时长：view 顶层 data.duration 是所有 P 之和（50 首合集 = 13348s），
+            // 拿它比单 P 的 streamDur 会把每条都判成预览桩，看门狗口径也跟着错。取不到 P 时长时退回顶层。
+            const totalDuration = Number(vd.data.duration) || 0
+            const pageDur = Number(pg && pg.duration) || 0
+            const duration = pageDur > 0 ? pageDur : totalDuration
             let rawDur = 0
             for (const d of pd.data.durl) rawDur += Number(d && d.duration) || 0
             const srcDur = rawDur > 0 ? rawDur : (Number(pd.data.timelength) || 0)
             const streamDur = srcDur > 0 && duration > 0 && srcDur < duration * 8 ? srcDur * 1000 : srcDur
             const preview = !!(duration > 0 && streamDur > 0 && streamDur < duration * 1000 * 0.6)
-            return { segs, duration, streamDur, preview, title: String(vd.data.title || ''), pic: String(vd.data.pic || ''), auth: biliCookieStr ? 'cookie' : 'anon' }
+            return { segs, duration, totalDuration, pageCount, pageIndex: page, streamDur, preview, title: String(vd.data.title || ''), pic: String(vd.data.pic || ''), auth: biliCookieStr ? 'cookie' : 'anon' }
           }
           // 强制重读浏览器 cookie（绕过内存 TTL）。粘贴来源不参与：用户手动粘的优先级最高，
           // 自动读取只允许改写 cookieSource 为 chrome 或空的情况。只在真的换到不同 cookie 时才重试取流。
@@ -834,10 +839,10 @@ print(json.dumps(out))\n')
           if (out.fail) { fail(out.fail); return }
           const idx = seg < out.segs.length ? seg : 0
           const url = out.segs[idx]
-          playurlCache = { at: Date.now(), key, url: out.segs[0], segs: out.segs, duration: out.duration, title: out.title, pic: out.pic, streamDur: out.streamDur, preview: out.preview, auth: out.auth }
+          playurlCache = { at: Date.now(), key, url: out.segs[0], segs: out.segs, duration: out.duration, totalDuration: out.totalDuration, pageCount: out.pageCount, pageIndex: out.pageIndex, title: out.title, pic: out.pic, streamDur: out.streamDur, preview: out.preview, auth: out.auth }
           const tk = mint(url)
-          alog('/ambient-playurl', 'tk=' + tk.slice(0, 12) + ' bvid=' + bvid + ' seg=' + idx + ' status=200 reason=ok segCount=' + out.segs.length + ' auth=' + out.auth + ' streamDur=' + out.streamDur + ' preview=' + (out.preview ? 1 : 0))
-          json(res, { ok: true, url, tk, duration: playurlCache.duration, title: playurlCache.title, pic: playurlCache.pic, segIndex: idx, segCount: out.segs.length, preview: !!out.preview, streamDur: out.streamDur })
+          alog('/ambient-playurl', 'tk=' + tk.slice(0, 12) + ' bvid=' + bvid + ' seg=' + idx + ' status=200 reason=ok segCount=' + out.segs.length + ' auth=' + out.auth + ' streamDur=' + out.streamDur + ' preview=' + (out.preview ? 1 : 0) + ' page=' + out.pageIndex + ' pageCount=' + out.pageCount)
+          json(res, { ok: true, url, tk, duration: playurlCache.duration, title: playurlCache.title, pic: playurlCache.pic, segIndex: idx, segCount: out.segs.length, preview: !!out.preview, streamDur: out.streamDur, pageCount: out.pageCount, pageIndex: out.pageIndex, totalDuration: out.totalDuration })
         } catch (e) { alog('/ambient-playurl', 'status=500 reason=playurl-fail:' + String(e && e.message || e).slice(0, 60)); json(res, { ok: false, error: 'playurl-fail' }) }
       },
     })
