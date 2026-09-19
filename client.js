@@ -76,15 +76,25 @@ window.__ModuleLoader__.load({
 				const pos = lastGoodTime;
 				log("HEAL " + reason + " pos=" + pos.toFixed(2) + " " + diag() + " attempt=" + attempt + "/" + maxRetries +
 					" (retry-in " + (STALL_RETRY_DELAYS[retries] || 0) + "ms)");
-				Promise.resolve().then(() => onStall(pos, attempt))
-					.catch((e) => { try { log("heal-error: " + e); } catch (e2) {} })
+				graceUntil = now() + healGraceMs;
+				// healing 复位收口：healer 真正恢复播放（seeked/兜底开播）后才调 finish；
+				// 另有超时保险 + fetch 异常路径，保证 healing 不会永久锁死
+				let finished = false;
+				let safety = null;
+				const finish = () => {
+					if (finished || disposed) return;
+					finished = true;
+					clearTo(safety);
+					healing = false;
+					lastProgressAt = now();
+				};
+				safety = setTo(() => { log("heal-finish-timeout"); finish(); }, healGraceMs + 15000);
+				Promise.resolve().then(() => onStall(pos, attempt, finish))
+					.catch((e) => { try { log("heal-error: " + e); } catch (e2) {} finish(); })
 					.then(() => {
 						if (disposed) return;
 						retries = attempt;
 						resumeTarget = pos;
-						healing = false;
-						lastProgressAt = now();
-						graceUntil = now() + healGraceMs;
 					});
 			}
 			function triggerStall(reason) {
@@ -97,6 +107,7 @@ window.__ModuleLoader__.load({
 				if (disposed) return false;
 				log("media-error " + diag() + (healing ? " (heal in flight)" : ""));
 				if (healing) return true;
+				if (now() < graceUntil) { log("media-error ignored (grace)"); return true; }
 				if (retries >= maxRetries) { giveUp("media-error"); return true; }
 				beginHeal("media-error");
 				return true;
@@ -171,30 +182,70 @@ window.__ModuleLoader__.load({
 			const fetchFn = opts.fetch || fetch;
 			const setTo = opts.setTimeout || setTimeout;
 			const getDisposed = opts.getDisposed || function () { return false; };
-			return function heal(pos) {
+			const SEEK_MAX_TRIES = 5;                   // 等 seekable 就绪上限（5×1.2s≈6s + 2500ms 首发），防卡在静音黑屏
+			const SEEK_RETRY_MS = 1200;
+			return function heal(pos, attempt, finish) {
+				if (!finish) finish = function () {};
 				const ctx = getCtx() || { bvid: "", page: 1 };
 				return fetchFn("/ambient-playurl?bvid=" + encodeURIComponent(ctx.bvid) + "&page=" + ctx.page)
 					.then((r) => r.json())
 					.then((r) => {
-						if (!r || !r.ok) { log("playurl refetch fail: " + ((r && r.error) || "?")); return; }
+						if (!r || !r.ok) { log("playurl refetch fail: " + ((r && r.error) || "?")); finish(); return; }
 						const el = getEl();
-						if (!el || getDisposed()) return;
+						if (!el || getDisposed()) { finish(); return; }
 						const src2 = r.tk ? "/ambient-proxy?t=" + r.tk : "/ambient-proxy?url=" + encodeURIComponent(r.url);
 						log("new tk minted, src=" + src2.slice(0, 40) + "… resume pos=" + pos.toFixed(2));
+						// 换源前先暂停+强制静音：autoPlay 在 load() 后会从 0 起播，先把这个窗口压成无声
+						const wasMuted = el.muted;
+						try { el.pause(); } catch (e) {}
+						el.muted = true;
+						log("heal-paused wasMuted=" + wasMuted);
 						el.src = src2;
-						let done = false;
-						const resumeOnce = () => {
-							if (done || getDisposed()) return;
-							done = true;
-							try { el.currentTime = pos; } catch (e) {}
-							doPlay();
+						let tries = 0, seekIssued = false, played = false;
+						const unmuteAndPlay = () => {
+							if (played) return;
+							played = true;
+							el.muted = wasMuted;
+							try { const pr = doPlay(); if (pr && pr.catch) pr.catch(() => {}); } catch (e) {}
+							finish();
 						};
-						el.addEventListener("loadedmetadata", resumeOnce, { once: true });
-						el.addEventListener("loadeddata", resumeOnce, { once: true });
-						setTo(() => { if (!done && !getDisposed() && el.readyState >= 1) resumeOnce(); }, 2500);
+						const trySeek = () => {
+							if (getDisposed()) { seekIssued = true; finish(); return; }
+							if (seekIssued) return;
+							tries += 1;
+							let ok = false;
+							try {
+								const sb = el.seekable;
+								if (sb && sb.length && pos <= sb.end(sb.length - 1) + 0.01) {
+									el.currentTime = pos;
+									ok = true;
+								}
+							} catch (e) { ok = false; }
+							if (ok) {
+								seekIssued = true;
+								log("seek-ok pos=" + pos.toFixed(2) + " tries=" + tries);
+								// seek 完成（seeked）瞬间才恢复音量出声；2s 兜底防 seeked 不触发
+								el.addEventListener("seeked", unmuteAndPlay, { once: true });
+								setTo(unmuteAndPlay, 2000);
+								if (!el.seeking) unmuteAndPlay();
+								return;
+							}
+							if (tries >= SEEK_MAX_TRIES) {
+								seekIssued = true;
+								log("seek-giveup retries=" + tries + " pos=" + pos.toFixed(2));
+								try { el.currentTime = pos; } catch (e) {}
+								unmuteAndPlay();
+								return;
+							}
+							log("seek-deferred tries=" + tries + " readyState=" + el.readyState);
+							setTo(trySeek, SEEK_RETRY_MS);
+						};
+						el.addEventListener("loadeddata", trySeek, { once: true });
+						el.addEventListener("canplay", trySeek, { once: true });
+						setTo(trySeek, 2500);
 						try { el.load(); } catch (e) {}
 					})
-					.catch((e) => log("refetch error: " + e));
+					.catch((e) => { log("refetch error: " + e); finish(); });
 			};
 		}
 
@@ -464,7 +515,7 @@ window.__ModuleLoader__.load({
 					const el = ref.current;
 					if (!el || !s.src) return;
 					let hls = null, flv = null, disposed = false, wd = null;
-					const doPlay = () => { try { const pr = el.play(); if (pr && pr.catch) pr.catch(() => { el.muted = true; el.play(); setState({ loopInfo: (s.loopInfo || "") + "（自动播放被拦，已静音续播）" }); }); } catch (e) { el.muted = true; el.play(); } };
+					const doPlay = () => { try { const pr = el.play(); if (pr && pr.catch) pr.catch(() => { el.muted = true; const pr2 = el.play(); if (pr2 && pr2.catch) pr2.catch(() => {}); setState({ loopInfo: (s.loopInfo || "") + "（自动播放被拦，已静音续播）" }); }); } catch (e) { el.muted = true; try { const pr3 = el.play(); if (pr3 && pr3.catch) pr3.catch(() => {}); } catch (e2) {} } };
 					if (s.site === "live" && s.liveFormat === "hls") {
 						ensureLib("hls").then((Hls) => {
 							if (disposed) return;
@@ -500,7 +551,7 @@ window.__ModuleLoader__.load({
 							});
 							wd = createStallWatchdog({
 								getEl: () => ref.current,
-								onStall: (pos, attempt) => healBiliVod(pos, attempt),
+								onStall: (pos, attempt, finish) => healBiliVod(pos, attempt, finish),
 								onGiveUp: () => { try { setState({ error: "B站VOD播放中断，多次重铸令牌续播失败（网络或CDN问题），已停止" }); } catch (e) {} },
 								log: (...a) => console.log("[stall-heal]", ...a),
 							});
